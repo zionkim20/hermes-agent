@@ -122,7 +122,7 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
 
     # Tier 3 — no edit support, progress messages are permanent
     "signal":          _TIER_LOW,
-    "whatsapp":        _TIER_MEDIUM,  # Baileys bridge supports /edit
+    "whatsapp":        {**_TIER_MEDIUM, "interim_assistant_messages": False},
     "bluebubbles":     _TIER_LOW,
     "weixin":          _TIER_LOW,
     "wecom":           _TIER_LOW,
@@ -135,6 +135,10 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
     "webhook":         _TIER_MINIMAL,
     "homeassistant":   _TIER_MINIMAL,
     "api_server":      {**_TIER_HIGH, "tool_preview_length": 0},
+}
+
+_PLATFORM_IGNORES_GLOBAL: dict[str, set[str]] = {
+    "whatsapp": {"interim_assistant_messages"},
 }
 
 # Canonical set of per-platform overrideable keys (for validation).
@@ -186,7 +190,8 @@ def resolve_display_setting(
     # 2. Global user setting (display.<key>).  Skip display.streaming because
     # that key controls only CLI terminal streaming; gateway token streaming is
     # governed by the top-level streaming config plus per-platform overrides.
-    if setting != "streaming":
+    ignores_global = setting in _PLATFORM_IGNORES_GLOBAL.get(platform_key, set())
+    if setting != "streaming" and not ignores_global:
         val = display_cfg.get(setting)
         if val is not None:
             return _normalise(setting, val)

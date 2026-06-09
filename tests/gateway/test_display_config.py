@@ -267,6 +267,30 @@ class TestPlatformDefaults:
         assert resolve_display_setting(config, "telegram", "long_running_notifications") is False
         assert resolve_display_setting(config, "telegram", "busy_ack_detail") is True
 
+    def test_whatsapp_interim_commentary_defaults_off_even_with_global_on(self):
+        from gateway.display_config import resolve_display_setting
+
+        config = {"display": {"interim_assistant_messages": True}}
+
+        assert resolve_display_setting({}, "whatsapp", "interim_assistant_messages") is False
+        assert resolve_display_setting(config, "whatsapp", "interim_assistant_messages") is False
+
+    def test_whatsapp_interim_commentary_can_opt_in_explicitly(self):
+        from gateway.display_config import resolve_display_setting
+
+        config = {
+            "display": {
+                "interim_assistant_messages": False,
+                "platforms": {
+                    "whatsapp": {
+                        "interim_assistant_messages": True,
+                    }
+                },
+            }
+        }
+
+        assert resolve_display_setting(config, "whatsapp", "interim_assistant_messages") is True
+
 
 # ---------------------------------------------------------------------------
 # Config migration: tool_progress_overrides → display.platforms

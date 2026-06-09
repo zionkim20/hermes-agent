@@ -810,6 +810,48 @@ async def test_run_agent_suppresses_interim_commentary_when_disabled(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_run_agent_suppresses_whatsapp_interim_commentary_by_default(
+    monkeypatch, tmp_path
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        CommentaryAgent,
+        session_id="sess-commentary-whatsapp-default-off",
+        platform=Platform.WHATSAPP,
+        config_data={"display": {"interim_assistant_messages": True}},
+    )
+
+    assert result.get("already_sent") is not True
+    assert not any(call["content"] == "I'll inspect the repo first." for call in adapter.sent)
+
+
+@pytest.mark.asyncio
+async def test_run_agent_allows_whatsapp_interim_commentary_with_platform_opt_in(
+    monkeypatch, tmp_path
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        CommentaryAgent,
+        session_id="sess-commentary-whatsapp-opt-in",
+        platform=Platform.WHATSAPP,
+        config_data={
+            "display": {
+                "platforms": {
+                    "whatsapp": {
+                        "interim_assistant_messages": True,
+                    }
+                }
+            }
+        },
+    )
+
+    assert result.get("already_sent") is not True
+    assert any(call["content"] == "I'll inspect the repo first." for call in adapter.sent)
+
+
+@pytest.mark.asyncio
 async def test_run_agent_tool_progress_does_not_control_interim_commentary(monkeypatch, tmp_path):
     """tool_progress=all with interim_assistant_messages=false should not surface commentary."""
     adapter, result = await _run_with_agent(

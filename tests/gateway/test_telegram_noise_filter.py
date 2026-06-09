@@ -1,4 +1,4 @@
-"""Telegram-specific gateway filtering for noisy status/error output."""
+"""Mobile-chat gateway filtering for noisy status/error output."""
 
 from gateway.config import Platform
 from gateway.run import (
@@ -17,14 +17,28 @@ def test_telegram_status_suppresses_auxiliary_and_retry_noise():
         "⏳ Retrying in 4.2s (attempt 1/3)...",
         "⏱️ Rate limited. Waiting 30.0s (attempt 2/3)...",
         "⚠️ Max retries (3) exhausted — trying fallback...",
+        "Preflight compression deferred: ~210,179 tokens >= 204,000 threshold. Will compact after the response boundary.",
+        "I’m preserving the thread so I don’t lose anything — give me a moment.",
+        "context compaction started — summarizing earlier conversation",
     ]
 
     for message in noisy_messages:
         assert _prepare_gateway_status_message(Platform.TELEGRAM, "warn", message) is None
 
 
-def test_non_telegram_status_is_unchanged():
-    """The Telegram quieting policy must not hide CLI/Discord diagnostics."""
+def test_whatsapp_status_suppresses_mobile_noise():
+    noisy_messages = [
+        "Preflight compression deferred: ~210,179 tokens >= 204,000 threshold. Will compact after the response boundary.",
+        "I’m preserving the thread so I don’t lose anything — give me a moment.",
+        "context compaction started — summarizing earlier conversation",
+    ]
+
+    for message in noisy_messages:
+        assert _prepare_gateway_status_message(Platform.WHATSAPP, "lifecycle", message) is None
+
+
+def test_non_mobile_status_is_unchanged():
+    """The mobile quieting policy must not hide CLI/Discord diagnostics."""
     message = "⏳ Retrying in 4.2s (attempt 1/3)..."
 
     assert _prepare_gateway_status_message(Platform.DISCORD, "lifecycle", message) == message

@@ -20,6 +20,8 @@ def test_telegram_status_suppresses_auxiliary_and_retry_noise():
         "Preflight compression deferred: ~210,179 tokens >= 204,000 threshold. Will compact after the response boundary.",
         "I’m preserving the thread so I don’t lose anything — give me a moment.",
         "context compaction started — summarizing earlier conversation",
+        "Configured auxiliary compression provider 'openrouter' is unavailable — context compression will drop middle turns without a summary.",
+        "I had to restart my working context — I still have your latest message.",
     ]
 
     for message in noisy_messages:
@@ -31,6 +33,8 @@ def test_whatsapp_status_suppresses_mobile_noise():
         "Preflight compression deferred: ~210,179 tokens >= 204,000 threshold. Will compact after the response boundary.",
         "I’m preserving the thread so I don’t lose anything — give me a moment.",
         "context compaction started — summarizing earlier conversation",
+        "Configured auxiliary compression provider 'openrouter' is unavailable — context compression will drop middle turns without a summary.",
+        "I had to restart my working context — I still have your latest message.",
     ]
 
     for message in noisy_messages:

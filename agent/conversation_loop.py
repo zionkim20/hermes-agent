@@ -432,6 +432,14 @@ def run_conversation(
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
 
+    _pre_turn_intake_context = getattr(agent, "_pre_turn_intake_context", None)
+    if _pre_turn_intake_context:
+        active_system_prompt = (
+            (active_system_prompt or "").rstrip()
+            + "\n\n"
+            + str(_pre_turn_intake_context).strip()
+        ).strip()
+
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
     final_response = None

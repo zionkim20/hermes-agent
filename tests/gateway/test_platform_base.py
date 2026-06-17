@@ -10,6 +10,8 @@ from gateway.platforms.base import (
     BasePlatformAdapter,
     GATEWAY_SECRET_CAPTURE_UNSUPPORTED_MESSAGE,
     MessageEvent,
+    MessageType,
+    looks_like_internal_planning_leak,
     safe_url_for_log,
     utf16_len,
     _log_safe_path,
@@ -22,6 +24,28 @@ class TestSecretCaptureGuidance:
         message = GATEWAY_SECRET_CAPTURE_UNSUPPORTED_MESSAGE
         assert "local cli" in message.lower()
         assert "~/.hermes/.env" in message
+
+
+class TestInternalPlanningLeakDetector:
+    def test_detects_untagged_scratchpad_plan(self):
+        text = (
+            "Need use terminal df pwd etc. Also calendar flight perhaps maybe not "
+            "need. But user says corrections. Need answer and perhaps update "
+            "memory? Important: Lisbon time only matters once arrives; "
+            "Wednesday plane no work; option 3 and open to majority stake. "
+            "Memory full maybe replace. Use memory? Need durable."
+        )
+        assert looks_like_internal_planning_leak(text) is True
+
+    def test_allows_short_user_facing_need_reply(self):
+        assert looks_like_internal_planning_leak("Need shorter.") is False
+
+    def test_allows_normal_answer_with_need(self):
+        text = (
+            "You need to restart the gateway after changing the profile. "
+            "The config change will not affect the running process until then."
+        )
+        assert looks_like_internal_planning_leak(text) is False
 
 
 class TestSafeUrlForLog:

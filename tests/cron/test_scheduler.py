@@ -1929,9 +1929,20 @@ class TestSilentDelivery:
             tick(verbose=False)
         deliver_mock.assert_not_called()
 
-    def test_failed_job_always_delivers(self):
-        """Failed jobs deliver regardless of [SILENT] in output."""
+    def test_failed_job_suppresses_delivery_by_default(self):
+        """Failed jobs are recorded but do not leak raw errors into chat by default."""
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+             patch("cron.scheduler.run_job", return_value=(False, "# output", "", "some error")), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.scheduler.mark_job_run"):
+            from cron.scheduler import tick
+            tick(verbose=False)
+        deliver_mock.assert_not_called()
+
+    def test_failed_job_delivers_when_explicitly_enabled(self):
+        job = {**self._make_job(), "deliver_failures": True}
+        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
              patch("cron.scheduler.run_job", return_value=(False, "# output", "", "some error")), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result") as deliver_mock, \
@@ -2217,12 +2228,13 @@ class TestBuildJobPromptMissingSkill:
         # prompt is preserved even though skill was skipped
         assert "do something" in result
 
-    def test_missing_skill_injects_user_notice_into_prompt(self):
-        """A system notice about the missing skill is injected into the prompt."""
+    def test_missing_skill_does_not_inject_user_notice_into_prompt(self):
+        """Missing skills stay out of user-facing cron output."""
         with patch("tools.skills_tool.skill_view", side_effect=self._missing_skill_view):
             result = _build_job_prompt({"skills": ["ghost-skill"], "prompt": "do something"})
-        assert "ghost-skill" in result
-        assert "not found" in result.lower() or "skipped" in result.lower()
+        assert "ghost-skill" not in result
+        assert "not found" not in result.lower()
+        assert "skipped" not in result.lower()
 
     def test_missing_skill_logs_warning(self, caplog):
         """A warning is logged when a skill cannot be found."""

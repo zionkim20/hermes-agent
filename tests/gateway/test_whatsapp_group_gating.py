@@ -5,7 +5,8 @@ from gateway.config import Platform, PlatformConfig, load_gateway_config
 
 
 def _make_adapter(require_mention=None, mention_patterns=None, free_response_chats=None,
-                  dm_policy=None, allow_from=None, group_policy=None, group_allow_from=None):
+                  dm_policy=None, allow_from=None, group_policy=None, group_allow_from=None,
+                  observe_unaddressed_groups=None):
     from gateway.platforms.whatsapp import WhatsAppAdapter
 
     extra = {}
@@ -23,6 +24,8 @@ def _make_adapter(require_mention=None, mention_patterns=None, free_response_cha
         extra["group_policy"] = group_policy
     if group_allow_from is not None:
         extra["group_allow_from"] = group_allow_from
+    if observe_unaddressed_groups is not None:
+        extra["observe_unaddressed_groups"] = observe_unaddressed_groups
 
     adapter = object.__new__(WhatsAppAdapter)
     adapter.platform = Platform.WHATSAPP
@@ -90,6 +93,29 @@ def test_group_messages_can_require_direct_trigger_via_config():
     assert adapter._should_process_message(_group_message("/status")) is True
 
 
+def test_unaddressed_group_messages_can_be_observed_without_processing():
+    adapter = _make_adapter(
+        require_mention=True,
+        observe_unaddressed_groups=True,
+        mention_patterns=[r"^\s*mia\b"],
+    )
+
+    assert adapter._should_process_message(_group_message("hello everyone")) is False
+    assert adapter._should_observe_message(_group_message("hello everyone")) is True
+    assert adapter._should_observe_message(_group_message("mia help")) is False
+
+
+def test_observe_unaddressed_groups_respects_group_policy():
+    adapter = _make_adapter(
+        require_mention=True,
+        observe_unaddressed_groups=True,
+        group_policy="allowlist",
+        group_allow_from=["999999999999@g.us"],
+    )
+
+    assert adapter._should_observe_message(_group_message("hello everyone")) is False
+
+
 def test_regex_mention_patterns_allow_custom_wake_words():
     adapter = _make_adapter(require_mention=True, mention_patterns=[r"^\s*chompy\b"])
 
@@ -111,6 +137,7 @@ def test_config_bridges_whatsapp_group_settings(monkeypatch, tmp_path):
     (hermes_home / "config.yaml").write_text(
         "whatsapp:\n"
         "  require_mention: true\n"
+        "  observe_unaddressed_groups: true\n"
         "  mention_patterns:\n"
         "    - \"^\\\\s*chompy\\\\b\"\n",
         encoding="utf-8",
@@ -118,14 +145,17 @@ def test_config_bridges_whatsapp_group_settings(monkeypatch, tmp_path):
 
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     monkeypatch.delenv("WHATSAPP_REQUIRE_MENTION", raising=False)
+    monkeypatch.delenv("WHATSAPP_OBSERVE_UNADDRESSED_GROUPS", raising=False)
     monkeypatch.delenv("WHATSAPP_MENTION_PATTERNS", raising=False)
 
     config = load_gateway_config()
 
     assert config is not None
     assert config.platforms[Platform.WHATSAPP].extra["require_mention"] is True
+    assert config.platforms[Platform.WHATSAPP].extra["observe_unaddressed_groups"] is True
     assert config.platforms[Platform.WHATSAPP].extra["mention_patterns"] == [r"^\s*chompy\b"]
     assert __import__("os").environ["WHATSAPP_REQUIRE_MENTION"] == "true"
+    assert __import__("os").environ["WHATSAPP_OBSERVE_UNADDRESSED_GROUPS"] == "true"
     assert json.loads(__import__("os").environ["WHATSAPP_MENTION_PATTERNS"]) == [r"^\s*chompy\b"]
 
 

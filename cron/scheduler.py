@@ -219,6 +219,24 @@ def _shutdown_parallel_pool() -> None:
 atexit.register(_shutdown_parallel_pool)
 
 
+def _should_deliver_failure(job: dict) -> bool:
+    """Return whether a failed cron run may post an error to chat."""
+    value = job.get("deliver_failures")
+    if value is None:
+        value = job.get("notify_on_failure")
+    if value is None:
+        try:
+            cfg = load_config() or {}
+            value = (cfg.get("cron", {}) if isinstance(cfg, dict) else {}).get(
+                "deliver_failures",
+                False,
+            )
+        except Exception:
+            value = False
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
 # Backward-compatible module override used by tests and emergency monkeypatches.
 _hermes_home: Path | None = None
 
@@ -1281,13 +1299,11 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         )
 
     if skipped:
-        notice = (
-            f"[IMPORTANT: The following skill(s) were listed for this job but could not be found "
-            f"and were skipped: {', '.join(skipped)}. "
-            f"Start your response with a brief notice so the user is aware, e.g.: "
-            f"'⚠️ Skill(s) not found and skipped: {', '.join(skipped)}']"
+        logger.warning(
+            "Cron job '%s': missing skill(s) skipped without user-visible notice: %s",
+            job.get("name", job.get("id")),
+            ", ".join(skipped),
         )
-        parts.insert(0, notice)
 
     if prompt:
         parts.extend(["", f"The user has provided the following instruction alongside the skill invocation: {prompt}"])
@@ -1372,7 +1388,8 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
     # Semantics:
     #   - script stdout (trimmed) → delivered verbatim as the final message
     #   - empty stdout            → silent run (no delivery, success=True)
-    #   - non-zero exit / timeout → delivered as an error alert, success=False
+    #   - non-zero exit / timeout → recorded as failed; chat delivery is
+    #                               controlled by deliver_failures
     #   - wakeAgent=false gate    → treated like empty stdout (silent), since
     #                               the whole point of no_agent is that there
     #                               is no agent to wake
@@ -1407,9 +1424,9 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         now_iso = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
 
         if not ok:
-            # Script crashed / timed out / exited non-zero.  Deliver the
-            # error so the user knows the watchdog itself broke — silent
-            # failure for an alerting job is the worst-case outcome.
+            # Script crashed / timed out / exited non-zero. Keep an alert
+            # payload for explicit admin delivery, but tick() suppresses it
+            # by default so client chats do not receive diagnostics.
             alert = (
                 f"⚠ Cron watchdog '{job_name}' script failed\n\n"
                 f"{output}\n\n"
@@ -2099,10 +2116,14 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
                 if verbose:
                     logger.info("Output saved to: %s", output_file)
 
-                # Deliver the final response to the origin/target chat.
-                # If the agent responded with [SILENT], skip delivery (but
-                # output is already saved above).  Failed jobs always deliver.
-                deliver_content = final_response if success else f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}"
+                # Deliver only successful user-facing output. Failed jobs are
+                # saved and marked failed, but do not post raw stack traces or
+                # operator diagnostics into client chats unless explicitly opted in.
+                deliver_content = final_response if success else (
+                    f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}"
+                    if _should_deliver_failure(job)
+                    else ""
+                )
                 # Treat whitespace-only final responses the same as empty
                 # responses: do not deliver a blank message, and let the
                 # empty-response guard below mark the run as a soft failure.
@@ -2110,6 +2131,12 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
                 if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
                     logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
                     should_deliver = False
+                if not success and not should_deliver:
+                    logger.warning(
+                        "Job '%s' failed; suppressing chat delivery of cron failure. Error: %s",
+                        job["id"],
+                        error,
+                    )
 
                 delivery_error = None
                 if should_deliver:

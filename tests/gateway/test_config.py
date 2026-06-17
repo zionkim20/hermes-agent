@@ -58,9 +58,9 @@ class TestPlatformConfigRoundtrip:
         restored = PlatformConfig.from_dict({"enabled": "false"})
         assert restored.enabled is False
 
-    def test_gateway_restart_notification_defaults_true(self):
-        assert PlatformConfig().gateway_restart_notification is True
-        assert PlatformConfig.from_dict({}).gateway_restart_notification is True
+    def test_gateway_restart_notification_defaults_false(self):
+        assert PlatformConfig().gateway_restart_notification is False
+        assert PlatformConfig.from_dict({}).gateway_restart_notification is False
 
     def test_gateway_restart_notification_roundtrip_false(self):
         pc = PlatformConfig(enabled=True, gateway_restart_notification=False)

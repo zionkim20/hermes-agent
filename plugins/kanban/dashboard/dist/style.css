@@ -278,6 +278,12 @@
   border: 1px solid color-mix(in srgb, var(--color-ring) 40%, transparent);
 }
 
+.hermes-kanban-kind {
+  font-size: 0.6rem !important;
+  padding: 0.05rem 0.3rem !important;
+  text-transform: lowercase;
+}
+
 .hermes-kanban-tag {
   font-size: 0.6rem !important;
   padding: 0.05rem 0.3rem !important;

@@ -14,7 +14,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
-from gateway.platforms.base import MessageEvent, MessageType, merge_pending_message_event
+from gateway.platforms.base import (
+    MessageEvent,
+    MessageType,
+    build_message_provenance_units,
+    merge_pending_message_event,
+)
 from gateway.run import GatewayRunner, _AGENT_PENDING_SENTINEL
 from gateway.session import SessionSource, build_session_key
 
@@ -224,6 +229,178 @@ def test_merge_pending_message_event_merges_text_and_photo_followups():
     assert merged.text == "first follow-up\n\nsee screenshot"
     assert merged.media_urls == ["/tmp/test.png"]
     assert merged.media_types == ["image/png"]
+
+
+def test_merge_pending_message_event_preserves_text_provenance_units():
+    pending = {}
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="dm",
+        user_id="u1",
+        user_name="Zion",
+    )
+    session_key = build_session_key(source)
+    first_text = "also when is that party I have to go to for zaya"
+    second_text = "and what time are we leaving saturday"
+
+    first = MessageEvent(
+        text=first_text,
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="m1",
+    )
+    second = MessageEvent(
+        text=second_text,
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="m2",
+    )
+
+    merge_pending_message_event(pending, session_key, first, merge_text=True)
+    merge_pending_message_event(pending, session_key, second, merge_text=True)
+
+    merged = pending[session_key]
+    assert merged.text == (
+        "also when is that party I have to go to for zaya\n"
+        "and what time are we leaving saturday"
+    )
+    assert [unit["source_message_id"] for unit in merged.provenance_units] == ["m1", "m2"]
+    assert [unit["text"] for unit in merged.provenance_units] == [first_text, second_text]
+    assert all(unit["source_type"] == "user_text" for unit in merged.provenance_units)
+    assert all(unit["trusted_for_intake"] for unit in merged.provenance_units)
+
+
+def test_voice_event_can_build_provenance_from_transcript_text():
+    source = SessionSource(
+        platform=Platform.WHATSAPP,
+        chat_id="wa-123",
+        chat_type="dm",
+        user_id="u1",
+        user_name="Zion",
+    )
+    event = MessageEvent(
+        text="",
+        message_type=MessageType.VOICE,
+        source=source,
+        message_id="voice-1",
+    )
+
+    units = build_message_provenance_units(
+        event,
+        text_override="Zaya's full name: Zaya De Melo Kim",
+    )
+
+    assert len(units) == 1
+    assert units[0]["source_message_id"] == "voice-1"
+    assert units[0]["source_type"] == "voice_transcript"
+    assert units[0]["trusted_for_intake"] is True
+    assert units[0]["text"] == "Zaya's full name: Zaya De Melo Kim"
+
+
+def test_runner_builds_queued_voice_provenance_from_prepared_transcript():
+    runner = _make_runner()
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="dm",
+        user_id="u1",
+        user_name="Zion",
+    )
+    event = MessageEvent(
+        text="",
+        message_type=MessageType.VOICE,
+        source=source,
+        message_id="voice-followup-1",
+    )
+
+    units = runner._provenance_units_for_prepared_event(
+        event,
+        "Zaya's full name: Zaya De Melo Kim",
+    )
+
+    assert units is not None
+    assert len(units) == 1
+    assert units[0]["source_message_id"] == "voice-followup-1"
+    assert units[0]["source_type"] == "voice_transcript"
+    assert units[0]["trusted_for_intake"] is True
+    assert units[0]["text"] == "Zaya's full name: Zaya De Melo Kim"
+
+
+def test_text_then_voice_merge_preserves_voice_provenance_placeholder():
+    pending = {}
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="dm",
+        user_id="u1",
+        user_name="Zion",
+    )
+    session_key = build_session_key(source)
+    first = MessageEvent(
+        text="renata went shopping today and got the yogurt",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="text-1",
+    )
+    voice = MessageEvent(
+        text="",
+        message_type=MessageType.VOICE,
+        source=source,
+        message_id="voice-1",
+        media_urls=["/tmp/voice.ogg"],
+        media_types=["audio/ogg"],
+    )
+
+    merge_pending_message_event(pending, session_key, first, merge_text=True)
+    merge_pending_message_event(pending, session_key, voice, merge_text=True)
+
+    units = pending[session_key].provenance_units
+    assert [unit["source_message_id"] for unit in units] == ["text-1", "voice-1"]
+    assert [unit["source_type"] for unit in units] == ["user_text", "voice_transcript"]
+    assert units[1]["trusted_for_intake"] is True
+    assert units[1]["text"] == ""
+
+
+def test_runner_fills_merged_voice_placeholder_from_prepared_transcript():
+    runner = _make_runner()
+    pending = {}
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="dm",
+        user_id="u1",
+        user_name="Zion",
+    )
+    session_key = build_session_key(source)
+    first_text = "renata went shopping today and got the yogurt"
+    first = MessageEvent(
+        text=first_text,
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="text-1",
+    )
+    voice = MessageEvent(
+        text="",
+        message_type=MessageType.VOICE,
+        source=source,
+        message_id="voice-1",
+        media_urls=["/tmp/voice.ogg"],
+        media_types=["audio/ogg"],
+    )
+    merge_pending_message_event(pending, session_key, first, merge_text=True)
+    merge_pending_message_event(pending, session_key, voice, merge_text=True)
+    merged = pending[session_key]
+
+    units = runner._provenance_units_for_prepared_event(
+        merged,
+        first_text + "\n\nZaya's full name: Zaya De Melo Kim",
+    )
+
+    assert units is not None
+    assert [unit["source_message_id"] for unit in units] == ["text-1", "voice-1"]
+    assert units[1]["source_type"] == "voice_transcript"
+    assert units[1]["text"] == "Zaya's full name: Zaya De Melo Kim"
 
 
 def test_merge_pending_message_event_promotes_document_followups_over_text():

@@ -562,13 +562,11 @@ async def test_send_home_channel_startup_notification_skipped_when_flag_disabled
 async def test_send_home_channel_startup_notification_default_flag_true(
     tmp_path, monkeypatch
 ):
-    """Default behavior is unchanged: missing flag means notifications still fire."""
+    """Lifecycle chat notifications require explicit opt-in."""
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
 
     runner, adapter = make_restart_runner()
-    # Sanity-check the dataclass default — guards against future refactors
-    # silently flipping the default to False.
-    assert runner.config.platforms[Platform.TELEGRAM].gateway_restart_notification is True
+    runner.config.platforms[Platform.TELEGRAM].gateway_restart_notification = True
 
     runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
         platform=Platform.TELEGRAM,

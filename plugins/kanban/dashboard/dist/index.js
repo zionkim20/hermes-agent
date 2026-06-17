@@ -2055,6 +2055,7 @@
     const [assignee, setAssignee] = useState("");
     const [reclaimFirst, setReclaimFirst] = useState(false);
     const [priority, setPriority] = useState("");
+    const [kind, setKind] = useState("");
     return h("div", { className: "hermes-kanban-bulk" },
       h("span", { className: "hermes-kanban-bulk-count" },
         `${props.count} ${tx(t, "selected", "selected")}`),
@@ -2122,6 +2123,27 @@
           disabled: priority === "",
           size: "sm",
         }, tx(t, "setPriority", "Set priority")),
+      ),
+      h("div", { className: "hermes-kanban-bulk-priority",
+                 title: "Set kind on selected tasks." },
+        h(Select, {
+          value: kind,
+          onChange: function (e) { setKind(e.target.value); },
+          className: "h-7 text-xs",
+        },
+          h(SelectOption, { value: "" }, "— kind —"),
+          h(SelectOption, { value: "engineering" }, "engineering"),
+          h(SelectOption, { value: "household" }, "household"),
+        ),
+        h(Button, {
+          onClick: function () {
+            if (!kind) return;
+            props.onApply({ kind: kind });
+            setKind("");
+          },
+          disabled: !kind,
+          size: "sm",
+        }, "Set kind"),
       ),
       h("div", { className: "hermes-kanban-bulk-reassign",
                  title: "Reassign selected tasks to a different Hermes profile. Pick a profile (or unassign) and click Apply." },
@@ -2545,6 +2567,8 @@
               ? h(Badge, { className: "hermes-kanban-priority",
                            title: `Priority ${t.priority}. Higher-priority tasks are claimed first by the dispatcher.` }, `P${t.priority}`)
               : null,
+            h(Badge, { variant: "outline", className: "hermes-kanban-kind",
+                       title: `Task kind: ${t.kind || "engineering"}` }, t.kind || "engineering"),
             t.tenant
               ? h(Badge, { variant: "outline", className: "hermes-kanban-tag",
                            title: `Tenant: ${t.tenant}. Free-form tag for grouping tasks (customer, project, team).` }, t.tenant)
@@ -2604,6 +2628,7 @@
     const [title, setTitle] = useState("");
     const [assignee, setAssignee] = useState("");
     const [priority, setPriority] = useState(0);
+    const [kind, setKind] = useState("engineering");
     const [parent, setParent] = useState("");
     const [skills, setSkills] = useState("");
     // Workspace controls. `scratch` (default) ignores path; `worktree` optionally
@@ -2627,6 +2652,7 @@
         title: trimmed,
         assignee: assignee.trim() || null,
         priority: Number(priority) || 0,
+        kind: kind,
         triage: props.columnName === "triage",
       };
       if (parent) body.parents = [parent];
@@ -2653,7 +2679,7 @@
         if (Number.isFinite(gmt) && gmt > 0) body.goal_max_turns = gmt;
       }
       props.onSubmit(body);
-      setTitle(""); setAssignee(""); setPriority(0); setParent(""); setSkills("");
+      setTitle(""); setAssignee(""); setPriority(0); setKind("engineering"); setParent(""); setSkills("");
       setWorkspaceKind("scratch"); setWorkspacePath("");
       setGoalMode(false); setGoalMaxTurns("");
     };
@@ -2703,6 +2729,15 @@
           className: "h-7 text-xs w-16",
           title: "Priority. Higher-priority tasks are claimed first by the dispatcher. 0 = default.",
         }),
+        h(Select, {
+          value: kind,
+          onChange: function (e) { setKind(e.target.value); },
+          className: "h-7 text-xs w-28",
+          title: "Task kind for Builder/Marie triage.",
+        },
+          h(SelectOption, { value: "engineering" }, "engineering"),
+          h(SelectOption, { value: "household" }, "household"),
+        ),
       ),
       h(Input, {
         value: skills,

@@ -325,6 +325,37 @@ class TestBridgeEventMetadata:
         assert event.raw_message["quotedRemoteJid"] == "15551234567@s.whatsapp.net"
         assert event.raw_message["hasQuotedMessage"] is True
 
+    @pytest.mark.asyncio
+    async def test_quoted_voice_reply_is_preserved_for_transcription(self):
+        adapter = _make_adapter()
+        data = {
+            "messageId": "incoming-msg",
+            "chatId": "15551234567@s.whatsapp.net",
+            "senderId": "15551234567@s.whatsapp.net",
+            "senderName": "Tester",
+            "chatName": "Tester",
+            "isGroup": False,
+            "body": "did you see this",
+            "hasMedia": False,
+            "mediaUrls": [],
+            "quotedMessageId": "quoted-voice-msg",
+            "quotedParticipant": "15559876543@s.whatsapp.net",
+            "quotedRemoteJid": "15551234567@s.whatsapp.net",
+            "hasQuotedMessage": True,
+            "quotedBody": "[quoted ptt message]",
+            "quotedMediaType": "ptt",
+            "quotedMediaUrls": ["/tmp/renata-voice.ogg"],
+        }
+
+        event = await adapter._build_message_event(data)
+
+        assert event is not None
+        assert event.text == "did you see this"
+        assert event.reply_to_message_id == "quoted-voice-msg"
+        assert event.reply_to_text == "[quoted ptt message]"
+        assert event.media_urls == ["/tmp/renata-voice.ogg"]
+        assert event.media_types == ["audio/ogg"]
+
 
 # ---------------------------------------------------------------------------
 # display_config tier classification

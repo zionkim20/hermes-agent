@@ -222,6 +222,46 @@ class TestSendOrEditMediaStripping:
         adapter.send.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_internal_planning_text_is_not_sent(self):
+        """Untagged scratchpad/planning prose should not become a chat bubble."""
+        adapter = MagicMock()
+        adapter.send = AsyncMock()
+        adapter.delete_message = AsyncMock(return_value=None)
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        consumer = GatewayStreamConsumer(adapter, "chat_123")
+        await consumer._send_or_edit(
+            "Need use terminal df pwd etc. Also calendar flight perhaps maybe "
+            "not need. But user says corrections. Need answer and perhaps "
+            "update memory? Use memory? Need durable."
+        )
+
+        adapter.send.assert_not_called()
+        adapter.delete_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_internal_planning_text_deletes_existing_preview(self):
+        """If a leaked preview already exists, suppression cleans it up."""
+        adapter = MagicMock()
+        adapter.send = AsyncMock()
+        adapter.delete_message = AsyncMock(return_value=None)
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        consumer = GatewayStreamConsumer(adapter, "chat_123")
+        consumer._message_id = "msg_leak"
+        consumer._last_sent_text = "Need use terminal"
+
+        await consumer._send_or_edit(
+            "Need use terminal df pwd etc. Also calendar flight perhaps maybe "
+            "not need. But user says corrections. Need answer and perhaps "
+            "update memory? Use memory? Need durable."
+        )
+
+        adapter.send.assert_not_called()
+        adapter.delete_message.assert_awaited_once_with("chat_123", "msg_leak")
+        assert consumer._message_id is None
+
+    @pytest.mark.asyncio
     async def test_cursor_only_update_skips_send(self):
         """A bare streaming cursor should not be sent as its own message."""
         adapter = MagicMock()
@@ -1907,4 +1947,3 @@ class TestUtf16OverflowDetection:
         # auto-attr mock. Verified indirectly by all the other tests in
         # this file passing — they all use MagicMock adapters.
         assert consumer is not None
-

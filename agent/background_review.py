@@ -27,6 +27,28 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 
+def _compact_saved_detail(value: Any, limit: int = 140) -> str:
+    text = str(value or "").strip()
+    text = " ".join(text.split())
+    if len(text) > limit:
+        return text[: limit - 3].rstrip() + "..."
+    return text
+
+
+def _review_target_label(target: str) -> str:
+    return "Memory" if target == "memory" else "User profile" if target == "user" else target
+
+
+def _saved_entry_summary(target: str, data: Dict[str, Any]) -> str:
+    entries = data.get("entries")
+    if not isinstance(entries, list) or not entries:
+        return ""
+    detail = _compact_saved_detail(entries[-1])
+    if not detail:
+        return ""
+    return f"{_review_target_label(target)} updated: {detail}"
+
+
 # Review-prompt strings — used by ``spawn_background_review_thread`` to build
 # the user-message that the forked review agent receives.  AIAgent exposes
 # them as class attributes (``_MEMORY_REVIEW_PROMPT`` etc.) for back-compat;
@@ -281,19 +303,17 @@ def summarize_background_review_actions(
             continue
         message = data.get("message", "")
         target = data.get("target", "")
+        saved_summary = _saved_entry_summary(str(target), data)
         if "created" in message.lower():
             actions.append(message)
         elif "updated" in message.lower():
-            actions.append(message)
+            actions.append(saved_summary or message)
         elif "added" in message.lower() or (target and "add" in message.lower()):
-            label = "Memory" if target == "memory" else "User profile" if target == "user" else target
-            actions.append(f"{label} updated")
+            actions.append(saved_summary or f"{_review_target_label(str(target))} updated")
         elif "Entry added" in message:
-            label = "Memory" if target == "memory" else "User profile" if target == "user" else target
-            actions.append(f"{label} updated")
+            actions.append(saved_summary or f"{_review_target_label(str(target))} updated")
         elif "removed" in message.lower() or "replaced" in message.lower():
-            label = "Memory" if target == "memory" else "User profile" if target == "user" else target
-            actions.append(f"{label} updated")
+            actions.append(saved_summary or f"{_review_target_label(str(target))} updated")
     return actions
 
 

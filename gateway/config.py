@@ -327,12 +327,10 @@ class PlatformConfig:
     # - "all": All chunks in multi-part replies thread to user's message
     reply_to_mode: str = "first"
 
-    # Whether the gateway is allowed to send "♻️ Gateway online" /
-    # "♻ Gateway restarted" lifecycle notifications on this platform.
-    # Default True preserves prior behavior. Set False on platforms used
-    # by end users (e.g. Slack) where operator-flavored restart pings are
-    # noise; keep True for back-channels where the operator wants them.
-    gateway_restart_notification: bool = True
+    # Whether the gateway is allowed to send lifecycle notifications on this
+    # platform. Default off protects client-facing chats from operator noise;
+    # opt in only for admin backchannels.
+    gateway_restart_notification: bool = False
 
     # Platform-specific settings
     extra: Dict[str, Any] = field(default_factory=dict)
@@ -372,7 +370,7 @@ class PlatformConfig:
             api_key=data.get("api_key"),
             home_channel=home_channel,
             reply_to_mode=data.get("reply_to_mode", "first"),
-            gateway_restart_notification=_coerce_bool(_grn, True),
+            gateway_restart_notification=_coerce_bool(_grn, False),
             extra=data.get("extra", {}),
         )
 
@@ -945,8 +943,12 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["group_allowed_chats"] = platform_cfg["group_allowed_chats"]
                 if plat == Platform.TELEGRAM and "allowed_topics" in platform_cfg:
                     bridged["allowed_topics"] = platform_cfg["allowed_topics"]
+                if "observe_unaddressed_groups" in platform_cfg:
+                    bridged["observe_unaddressed_groups"] = platform_cfg["observe_unaddressed_groups"]
                 if "free_response_channels" in platform_cfg:
                     bridged["free_response_channels"] = platform_cfg["free_response_channels"]
+                if "free_response_chats" in platform_cfg:
+                    bridged["free_response_chats"] = platform_cfg["free_response_chats"]
                 if "mention_patterns" in platform_cfg:
                     bridged["mention_patterns"] = platform_cfg["mention_patterns"]
                 if "exclusive_bot_mentions" in platform_cfg:
@@ -985,6 +987,8 @@ def load_gateway_config() -> GatewayConfig:
                 plat_data, extra = _ensure_platform_extra_dict(platforms_data, plat.value)
                 if enabled_was_explicit:
                     plat_data["enabled"] = platform_cfg["enabled"]
+                if "gateway_restart_notification" in bridged:
+                    plat_data["gateway_restart_notification"] = bridged.pop("gateway_restart_notification")
                 if plat == Platform.SLACK and enabled_was_explicit:
                     extra["_enabled_explicit"] = True
                 extra.update(bridged)
@@ -1158,6 +1162,8 @@ def load_gateway_config() -> GatewayConfig:
             if isinstance(whatsapp_cfg, dict):
                 if "require_mention" in whatsapp_cfg and not os.getenv("WHATSAPP_REQUIRE_MENTION"):
                     os.environ["WHATSAPP_REQUIRE_MENTION"] = str(whatsapp_cfg["require_mention"]).lower()
+                if "observe_unaddressed_groups" in whatsapp_cfg and not os.getenv("WHATSAPP_OBSERVE_UNADDRESSED_GROUPS"):
+                    os.environ["WHATSAPP_OBSERVE_UNADDRESSED_GROUPS"] = str(whatsapp_cfg["observe_unaddressed_groups"]).lower()
                 if "mention_patterns" in whatsapp_cfg and not os.getenv("WHATSAPP_MENTION_PATTERNS"):
                     os.environ["WHATSAPP_MENTION_PATTERNS"] = json.dumps(whatsapp_cfg["mention_patterns"])
                 frc = whatsapp_cfg.get("free_response_chats")

@@ -39,6 +39,7 @@ from gateway.run import (
     _coerce_gateway_timestamp,
     _is_fresh_gateway_interruption,
     _last_transcript_timestamp,
+    _normalize_resume_continuation_response,
     _should_clear_resume_pending_after_turn,
 )
 from gateway.session import SessionEntry, SessionSource, SessionStore
@@ -68,6 +69,24 @@ def test_resume_pending_is_cleared_only_after_successful_turn():
     assert _should_clear_resume_pending_after_turn({"failed": True}) is False
     assert _should_clear_resume_pending_after_turn({"partial": True}) is False
     assert _should_clear_resume_pending_after_turn({"error": "boom"}) is False
+    assert _should_clear_resume_pending_after_turn({
+        "completed": True,
+        "final_response": "I'm preserving the thread so I don't lose anything — give me a moment.",
+    }) is False
+    assert _should_clear_resume_pending_after_turn({
+        "completed": True,
+        "final_response": "I'm here. Last completed state: video shoot scheduling scanned.",
+    }) is False
+    assert _should_clear_resume_pending_after_turn({
+        "completed": True,
+        "final_response": "I had to restart my working context — I still have your latest message.",
+    }) is False
+
+
+def test_resume_status_response_uses_plain_household_language():
+    assert _normalize_resume_continuation_response(
+        "I had to restart my working state — I still have your latest message."
+    ) == "I’m picking this back up now and continuing from your latest message."
 
 
 def _make_source(platform=Platform.TELEGRAM, chat_id="123", user_id="u1"):
@@ -155,8 +174,11 @@ def _simulate_note_injection(
         message = (
             f"[System note: Your previous turn in this session was interrupted "
             f"by {reason_phrase}. The conversation history below is intact. "
-            f"If it contains unfinished tool result(s), process them first and "
-            f"summarize what was accomplished, then address the user's new "
+            f"Resume the interrupted work now. Do not only recap. Continue "
+            f"to the next externally useful stopping point; if you cannot "
+            f"continue, state the concrete blocker and the exact next "
+            f"approval or input needed. If the history contains unfinished "
+            f"tool result(s), process them before addressing the user's new "
             f"message below.]\n\n"
             + message
         )

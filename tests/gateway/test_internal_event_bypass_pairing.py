@@ -149,6 +149,43 @@ async def test_internal_event_bypasses_authorization(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_observe_only_group_message_persists_without_auth_or_agent(monkeypatch, tmp_path):
+    """Unaddressed WhatsApp group traffic should become context, not a reply."""
+    import gateway.run as gateway_run
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    (tmp_path / "config.yaml").write_text("", encoding="utf-8")
+
+    runner = GatewayRunner(GatewayConfig())
+    source = SessionSource(
+        platform=Platform.WHATSAPP,
+        chat_id="120363001234567890@g.us",
+        chat_type="group",
+        user_id="external-user",
+        user_name="Chef",
+    )
+    event = MessageEvent(
+        text="Dinner should be ready at 6.",
+        source=source,
+        raw_message={"_hermes_observe_only": True},
+    )
+
+    agent_spy = AsyncMock(return_value=None)
+    monkeypatch.setattr(runner, "_handle_message_with_agent", agent_spy)
+    monkeypatch.setattr(runner, "_is_user_authorized", lambda _source: False)
+
+    result = await runner._handle_message(event)
+
+    assert result is None
+    agent_spy.assert_not_awaited()
+    entry = runner.session_store.get_or_create_session(source)
+    transcript = runner.session_store.load_transcript(entry.session_id)
+    assert transcript[-1]["role"] == "user"
+    assert "Silent group observation" in transcript[-1]["content"]
+    assert "[Chef] Dinner should be ready at 6." in transcript[-1]["content"]
+
+
+@pytest.mark.asyncio
 async def test_internal_event_does_not_trigger_pairing(monkeypatch, tmp_path):
     """An internal event with no user_id must not generate a pairing code."""
     import gateway.run as gateway_run

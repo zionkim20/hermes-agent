@@ -1169,6 +1169,7 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     _reply_anchor_for_event,
+    build_message_provenance_units,
     merge_pending_message_event,
 )
 from gateway.restart import (
@@ -1735,8 +1736,8 @@ def _normalize_empty_agent_response(
         ) or ("400" in error_str and history_len > 50)
         if is_context_failure:
             return (
-                "⚠️ Session too large for the model's context window.\n"
-                "Use /compact to compress the conversation, or "
+                "⚠️ This chat has gotten too long for me to process safely.\n"
+                "Use /compact to shorten the chat, or "
                 "/reset to start fresh."
             )
         return (
@@ -1757,6 +1758,185 @@ def _normalize_empty_agent_response(
     return response
 
 
+_RESUME_PENDING_INCOMPLETE_RESPONSE_MARKERS = (
+    "give me a moment",
+    "preserving the thread",
+    "so i don't lose anything",
+    "so i do not lose anything",
+    "last completed state",
+    "working context",
+    "working state",
+    "restart my working",
+    "i still have your latest message",
+    "context compaction started",
+    "summarizing earlier conversation",
+    "summarising earlier conversation",
+)
+
+
+_USER_SAFE_COMPRESSION_STATUS = "I’m keeping everything together while I work."
+_USER_SAFE_RESUME_STATUS = "I’m picking this back up now and continuing from your latest message."
+
+
+_STATUS_LOGS_ONLY_MARKERS = (
+    "configured auxiliary compression provider",
+    "no auxiliary llm provider configured",
+    "auxiliary.compression",
+    "openrouter_api_key",
+    "openrouter",
+    "config.yaml",
+    "context compression will drop middle turns",
+)
+
+
+_STATUS_COMPRESSION_PROGRESS_MARKERS = (
+    "preflight compression",
+    "context compaction started",
+    "context compression started",
+    "compacting context",
+    "summarizing earlier conversation",
+    "summarising earlier conversation",
+)
+
+
+_STATUS_INTERNAL_ONLY_MARKERS = (
+    " tokens >=",
+    " threshold",
+    "need snapshot",
+    "need read ",
+    "need query ",
+    "need maybe",
+)
+
+
+def _gateway_user_status_message(event_type: str, message: object) -> Optional[str]:
+    """Return the chat-safe version of a runtime status, or None for logs-only.
+
+    Model/runtime internals are useful for operators but jarring in household
+    chats. Keep this as a narrow outbound boundary: lower layers may emit rich
+    diagnostics, but messaging platforms should only receive user-safe progress.
+    """
+    text = str(message or "").strip()
+    if not text:
+        return None
+    lower = text.casefold()
+    if any(marker in lower for marker in _STATUS_LOGS_ONLY_MARKERS):
+        return None
+    if any(marker in lower for marker in _STATUS_COMPRESSION_PROGRESS_MARKERS):
+        return _USER_SAFE_COMPRESSION_STATUS
+    if any(marker in lower for marker in _STATUS_INTERNAL_ONLY_MARKERS):
+        return None
+    return text
+
+
+_INTERIM_INTERNAL_PLANNING_MARKERS = (
+    "need perhaps",
+    "need maybe",
+    "need log",
+    "user says",
+    "could set cron",
+    "use terminal date",
+    "approval-gated",
+    "whatsapp bridge",
+    "current date",
+    "need schedule",
+)
+
+
+def _gateway_user_interim_message(message: object) -> Optional[str]:
+    """Return a chat-safe interim assistant message, or None for scratchpad.
+
+    Interim messages are useful when they are plain progress notes. They are
+    harmful when the model emits compressed internal planning ("Need perhaps
+    create cron? User says..."). Final answers still go through the normal
+    response path; this only gates optional mid-turn commentary.
+    """
+    text = str(message or "").strip()
+    if not text:
+        return None
+    lower = text.casefold()
+    if lower.startswith("need "):
+        return None
+    if any(marker in lower for marker in _INTERIM_INTERNAL_PLANNING_MARKERS):
+        return None
+    if lower.count(" need ") >= 2:
+        return None
+    return text
+
+
+def _friendly_approval_description(description: object) -> str:
+    text = str(description or "").strip()
+    if not text or text.casefold() == "dangerous command":
+        return "this action changes something outside the chat"
+    return text
+
+
+def _format_gateway_exec_approval_prompt(command: object, description: object) -> str:
+    cmd = str(command or "")
+    cmd_preview = cmd[:200] + "..." if len(cmd) > 200 else cmd
+    reason = _friendly_approval_description(description)
+    return (
+        "**Approval needed before I continue**\n\n"
+        "I’m about to take an action outside this chat, so I need an explicit yes first.\n\n"
+        f"Reason: {reason}\n\n"
+        f"Technical preview:\n```\n{cmd_preview}\n```\n\n"
+        "Reply `/approve` to allow it once, `/approve session` to allow this kind "
+        "of action for this session, `/approve always` to remember it, or `/deny` "
+        "to cancel."
+    )
+
+
+_FRIENDLY_ACTIVITY_LABELS = {
+    "delegate_task": "checking this in the background",
+    "execute_code": "running a local check",
+    "browser": "checking the page",
+    "browser_click": "checking the page",
+    "browser_navigate": "checking the page",
+    "browser_snapshot": "checking the page",
+    "terminal": "running a local check",
+    "read_file": "checking the files",
+    "write_file": "updating the files",
+    "edit_file": "updating the files",
+    "send_message": "preparing an external message",
+}
+
+
+def _friendly_activity_detail(activity: Optional[dict]) -> str:
+    if not isinstance(activity, dict):
+        return ""
+    current_tool = str(activity.get("current_tool") or "").strip()
+    if current_tool:
+        return _FRIENDLY_ACTIVITY_LABELS.get(current_tool, "working through the task")
+    desc = str(activity.get("last_activity_desc") or "").strip().casefold()
+    if not desc:
+        return ""
+    if "receiving stream response" in desc:
+        return "working through the response"
+    if "tool" in desc or "running" in desc:
+        return "working through the task"
+    return ""
+
+
+def _format_long_running_notice(elapsed_mins: int, activity: Optional[dict] = None) -> str:
+    elapsed = max(0, int(elapsed_mins or 0))
+    detail = _friendly_activity_detail(activity)
+    if detail:
+        return f"Still working... {elapsed} min elapsed — {detail}."
+    return f"Still working... {elapsed} min elapsed."
+
+
+def _looks_like_resume_continuation_only_response(response: object) -> bool:
+    text = str(response or "").strip().lower()
+    return bool(text and any(marker in text for marker in _RESUME_PENDING_INCOMPLETE_RESPONSE_MARKERS))
+
+
+def _normalize_resume_continuation_response(response: object) -> str:
+    text = str(response or "").strip()
+    if _looks_like_resume_continuation_only_response(text):
+        return _USER_SAFE_RESUME_STATUS
+    return text
+
+
 def _should_clear_resume_pending_after_turn(agent_result: dict) -> bool:
     """Return True only when a gateway turn really completed successfully.
 
@@ -1773,6 +1953,8 @@ def _should_clear_resume_pending_after_turn(agent_result: dict) -> bool:
     if agent_result.get("failed") or agent_result.get("partial") or agent_result.get("error"):
         return False
     if agent_result.get("completed") is False:
+        return False
+    if _looks_like_resume_continuation_only_response(agent_result.get("final_response")):
         return False
     return True
 
@@ -6190,6 +6372,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # are system-generated and must skip user authorization.
         is_internal = bool(getattr(event, "internal", False))
 
+        if self._is_observe_only_event(event):
+            await self._record_observed_message(event)
+            return None
+
         # Fire pre_gateway_dispatch plugin hook for user-originated messages.
         # Plugins receive the MessageEvent and may return a dict influencing flow:
         #   {"action": "skip",    "reason": ...}    -> drop (no reply, plugin handled)
@@ -7354,6 +7540,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # missed the leftover real agent — locking the session out forever (#28686).
             self._release_running_agent_state(_quick_key)
 
+    def _is_observe_only_event(self, event: MessageEvent) -> bool:
+        raw = getattr(event, "raw_message", None)
+        return isinstance(raw, dict) and bool(raw.get("_hermes_observe_only"))
+
+    async def _record_observed_message(self, event: MessageEvent) -> None:
+        source = event.source
+        if source is None:
+            return
+        session_entry = self.session_store.get_or_create_session(source)
+        ts = datetime.now().isoformat()
+        content = event.text or ""
+        if source.user_name:
+            content = f"[{source.user_name}] {content}"
+        self.session_store.append_to_transcript(
+            session_entry.session_id,
+            {
+                "role": "user",
+                "content": "[Silent group observation; no response requested]\n" + content,
+                "timestamp": ts,
+                "metadata": {
+                    "observe_only": True,
+                    "platform": source.platform.value if source.platform else "",
+                    "chat_type": source.chat_type,
+                    "chat_id": source.chat_id,
+                    "user_id": source.user_id,
+                },
+            },
+        )
+        self.session_store.update_session(session_entry.session_key)
+        logger.info(
+            "observed unaddressed group message: platform=%s user=%s chat=%s",
+            source.platform.value if source.platform else "unknown",
+            source.user_name or source.user_id or "unknown",
+            source.chat_id or "unknown",
+        )
+
     async def _prepare_inbound_message_text(
         self,
         *,
@@ -8138,59 +8360,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             f"{_new_tokens:,}",
                                         )
 
-                                    # If summary generation failed, the
-                                    # compressor aborts entirely and returns
-                                    # messages unchanged — nothing is dropped.
-                                    # Surface a visible warning to the gateway
-                                    # user — agent.log alone is invisible on
-                                    # TG/Discord/etc. — so they know the chat
-                                    # is "frozen" at the current size and can
-                                    # /compress to retry or /reset to start
-                                    # fresh.
+                                    # If compression diagnostics occur, keep
+                                    # them in ops logs. Household chats should
+                                    # not receive provider names, config paths,
+                                    # token counts, or stack-style details.
                                     _comp = getattr(_hyg_agent, "context_compressor", None)
                                     if _comp is not None and getattr(_comp, "_last_compress_aborted", False):
                                         _err = getattr(_comp, "_last_summary_error", None) or "unknown error"
-                                        _warn_msg = (
-                                            "⚠️ Context compression aborted "
-                                            f"({_err}). No messages were dropped — "
-                                            "conversation is unchanged. Run /compress "
-                                            "to retry, /reset for a clean session, or "
-                                            "check your auxiliary.compression model "
-                                            "configuration."
+                                        logger.warning(
+                                            "Session hygiene compression summary failed: session=%s error=%s",
+                                            session_key,
+                                            _err,
                                         )
-                                        try:
-                                            _adapter = self.adapters.get(source.platform)
-                                            if _adapter and source.chat_id:
-                                                await _adapter.send(source.chat_id, _warn_msg, metadata=_hyg_meta)
-                                        except Exception as _werr:
-                                            logger.warning(
-                                                "Failed to deliver compression-failure warning to user: %s",
-                                                _werr,
-                                            )
-                                    # Separately: if the user's CONFIGURED aux
-                                    # model failed and we recovered by falling
-                                    # back to the main model, tell them — a
-                                    # misconfigured auxiliary.compression.model
-                                    # is something only they can fix, and
-                                    # silent recovery would hide it.
                                     elif _comp is not None and getattr(_comp, "_last_aux_model_failure_model", None):
                                         _aux_model = getattr(_comp, "_last_aux_model_failure_model", "")
                                         _aux_err = getattr(_comp, "_last_aux_model_failure_error", None) or "unknown error"
-                                        _aux_msg = (
-                                            f"ℹ️ Configured compression model `{_aux_model}` "
-                                            f"failed ({_aux_err}). Recovered using your main "
-                                            "model — context is intact — but you may want to "
-                                            "check `auxiliary.compression.model` in config.yaml."
+                                        logger.warning(
+                                            "Session hygiene auxiliary compression model failed and recovered via main model: session=%s model=%s error=%s",
+                                            session_key,
+                                            _aux_model,
+                                            _aux_err,
                                         )
-                                        try:
-                                            _adapter = self.adapters.get(source.platform)
-                                            if _adapter and source.chat_id:
-                                                await _adapter.send(source.chat_id, _aux_msg, metadata=_hyg_meta)
-                                        except Exception as _werr:
-                                            logger.warning(
-                                                "Failed to deliver aux-model-fallback notice to user: %s",
-                                                _werr,
-                                            )
                                 finally:
                                     # Evict the cached agent so the next turn
                                     # rebuilds its system prompt from current
@@ -8319,6 +8509,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             }
             await self.hooks.emit("agent:start", hook_ctx)
 
+            provenance_units = self._provenance_units_for_prepared_event(event, message_text)
+
             # Run the agent
             agent_result = await self._run_agent(
                 message=message_text,
@@ -8330,6 +8522,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
                 channel_prompt=event.channel_prompt,
+                provenance_units=provenance_units,
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -8402,7 +8595,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             response = _normalize_empty_agent_response(
                 agent_result, response, history_len=len(history),
             )
+            original_response = response
             response = _sanitize_gateway_final_response(source.platform, response)
+            response = _normalize_resume_continuation_response(response)
 
             # Ordering contract: the agent thread already updated the contextvar
             # in conversation_compression.py; propagate to SessionEntry + _save().
@@ -8571,8 +8766,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if hasattr(self, "_pending_model_notes"):
                     self._pending_model_notes.pop(session_key, None)
                 response = (response or "") + (
-                    "\n\n🔄 Session auto-reset — the conversation exceeded the "
-                    "maximum context size and could not be compressed further. "
+                    "\n\nSession reset automatically because this chat got too "
+                    "long for me to process safely. "
                     "Your next message will start a fresh session."
                 )
 
@@ -8660,6 +8855,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         ):
                             entry["message_id"] = str(event.message_id)
                             _user_msg_id_attached = True
+                        if (
+                            msg.get("role") == "assistant"
+                            and original_response
+                            and response != original_response
+                            and str(msg.get("content") or "").strip() == original_response
+                        ):
+                            entry["content"] = response
                         self.session_store.append_to_transcript(
                             session_entry.session_id, entry,
                             skip_db=agent_persisted,
@@ -8793,8 +8995,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # for the API to process — treat it the same way.
                 if _hist_len > 50:
                     return (
-                        "⚠️ Session too large for the model's context window.\n"
-                        "Use /compact to compress the conversation, or "
+                        "⚠️ This chat has gotten too long for me to process safely.\n"
+                        "Use /compact to shorten the chat, or "
                         "/reset to start fresh."
                     )
                 elif status_code == 400:
@@ -12440,6 +12642,104 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return url.rstrip("/")
         return None
 
+    def _capture_pre_turn_state_context(
+        self,
+        *,
+        message: str,
+        session_key: Optional[str],
+        event_message_id: Optional[str],
+        provenance_units: Optional[List[Dict[str, Any]]],
+    ) -> str:
+        pre_turn_intake_context = ""
+        pre_turn_intake_cards: list[dict[str, Any]] = []
+        pre_turn_context_parts: list[str] = []
+        try:
+            from gateway import kanban_intake as _kanban_intake
+
+            pre_turn_intake_cards = _kanban_intake.capture_inbound(
+                message,
+                session_key=session_key or "",
+                event_message_id=event_message_id,
+                provenance_units=provenance_units,
+            )
+            pre_turn_intake_context = _kanban_intake.format_pre_turn_context(
+                pre_turn_intake_cards
+            )
+            if pre_turn_intake_context:
+                pre_turn_context_parts.append(pre_turn_intake_context)
+        except Exception as _intake_exc:
+            logger.warning("kanban intake pre-capture failed: %s", _intake_exc)
+        try:
+            from agent import task_state as _task_state
+
+            pre_turn_task_context = _task_state.render_active_task_context(
+                user_message=message,
+                session_key=session_key or "",
+                source_message_id=str(event_message_id or ""),
+                provenance_units=provenance_units,
+            )
+            if pre_turn_task_context:
+                pre_turn_context_parts.append(pre_turn_task_context)
+        except Exception as _task_state_exc:
+            logger.warning("task state pre-capture failed: %s", _task_state_exc)
+        pre_turn_context = "\n\n".join(
+            part.strip() for part in pre_turn_context_parts if part and part.strip()
+        )
+        if pre_turn_context:
+            logger.info(
+                "pre-turn state captured %d kanban card(s) before model turn for session=%s",
+                len(pre_turn_intake_cards),
+                session_key or "",
+            )
+        return pre_turn_context
+
+    def _provenance_units_for_prepared_event(
+        self,
+        event: Optional[MessageEvent],
+        prepared_text: Optional[str],
+    ) -> Optional[List[Dict[str, Any]]]:
+        if event is None:
+            return None
+        units = build_message_provenance_units(event)
+        prepared = (prepared_text or "").strip()
+        if units and prepared:
+            residual = prepared
+            for unit in units:
+                existing_text = str(unit.get("text") or "").strip()
+                if existing_text and existing_text in residual:
+                    residual = residual.replace(existing_text, "", 1)
+            residual = re.sub(r"\s+", " ", residual).strip(" -:\n\t")
+            if residual and (
+                event.message_type in {MessageType.VOICE, MessageType.AUDIO}
+                or any(
+                    unit.get("source_type") == "voice_transcript" and not str(unit.get("text") or "").strip()
+                    for unit in units
+                )
+            ):
+                filled = False
+                for unit in units:
+                    if unit.get("source_type") == "voice_transcript" and not str(unit.get("text") or "").strip():
+                        unit["text"] = residual
+                        filled = True
+                        break
+                if not filled and not any(
+                    unit.get("source_type") == "voice_transcript"
+                    and str(unit.get("text") or "").strip() == residual
+                    for unit in units
+                ):
+                    units.extend(
+                        build_message_provenance_units(
+                            event,
+                            text_override=residual,
+                        )
+                    )
+        if not units and prepared_text:
+            units = build_message_provenance_units(
+                event,
+                text_override=prepared_text,
+            )
+        return units
+
     async def _run_agent_via_proxy(
         self,
         message: str,
@@ -12738,6 +13038,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        provenance_units: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -12751,11 +13052,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         This is run in a thread pool to not block the event loop.
         Supports interruption via new messages.
         """
+        pre_turn_intake_context = self._capture_pre_turn_state_context(
+            message=message,
+            session_key=session_key,
+            event_message_id=event_message_id,
+            provenance_units=provenance_units,
+        )
+
         # ---- Proxy mode: delegate to remote API server ----
         if self._get_proxy_url():
+            proxy_context_prompt = context_prompt
+            if pre_turn_intake_context:
+                proxy_context_prompt = (
+                    (proxy_context_prompt + "\n\n" + pre_turn_intake_context)
+                    if proxy_context_prompt
+                    else pre_turn_intake_context
+                )
             return await self._run_agent_via_proxy(
                 message=message,
-                context_prompt=context_prompt,
+                context_prompt=proxy_context_prompt,
                 history=history,
                 source=source,
                 session_id=session_id,
@@ -13387,6 +13702,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         def _step_callback_sync(iteration: int, prev_tools: list) -> None:
             if not _run_still_current():
                 return
+            if session_key:
+                try:
+                    from agent import task_state as _task_state
+                    _task_state.update_turn_checkpoint(
+                        session_key=session_key,
+                        activity=f"working step {iteration}",
+                        api_call_count=iteration,
+                    )
+                except Exception as _ckpt_err:
+                    logger.debug("turn checkpoint step update failed: %s", _ckpt_err)
+            if not _hooks_ref.loaded_hooks:
+                return
             # prev_tools may be list[str] or list[dict] with "name"/"result"
             # keys.  Normalise to keep "tool_names" backward-compatible for
             # user-authored hooks that do ', '.join(tool_names)'.
@@ -13424,14 +13751,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             }
         else:
             _status_thread_metadata = self._thread_metadata_for_source(source, event_message_id) if _progress_thread_id else None
+        _sent_user_status_messages: set[str] = set()
 
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter or not _run_still_current():
                 return
+            user_message = _gateway_user_status_message(event_type, message)
+            if user_message is None:
+                logger.debug(
+                    "status_callback suppressed for user chat: event_type=%s message=%r",
+                    event_type,
+                    str(message or "")[:240],
+                )
+                return
             prepared_message = _prepare_gateway_status_message(
                 source.platform,
                 event_type,
-                message,
+                user_message,
             )
             if prepared_message is None:
                 logger.debug(
@@ -13441,6 +13777,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _redact_gateway_user_facing_secrets(str(message or ""))[:160],
                 )
                 return
+            if prepared_message in _sent_user_status_messages:
+                return
+            _sent_user_status_messages.add(prepared_message)
             _fut = safe_schedule_threadsafe(
                 _send_or_update_status_coro(_status_adapter, _status_chat_id, event_type, prepared_message, _status_thread_metadata),
                 _loop_for_step,
@@ -13604,18 +13943,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
                 if not _run_still_current():
                     return
+                user_message = _gateway_user_interim_message(text)
+                if not user_message:
+                    logger.info(
+                        "interim_assistant_callback suppressed for user chat: message=%r",
+                        str(text or "")[:240],
+                    )
+                    return
                 if _stream_consumer is not None:
                     if already_streamed:
                         _stream_consumer.on_segment_break()
                     else:
-                        _stream_consumer.on_commentary(text)
+                        _stream_consumer.on_commentary(user_message)
                     return
-                if already_streamed or not _status_adapter or not str(text or "").strip():
+                if already_streamed or not _status_adapter:
                     return
                 safe_schedule_threadsafe(
                     _status_adapter.send(
                         _status_chat_id,
-                        text,
+                        user_message,
                         metadata=_status_thread_metadata,
                     ),
                     _loop_for_step,
@@ -13742,6 +14088,65 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             agent.reasoning_config = reasoning_config
             agent.service_tier = self._service_tier
             agent.request_overrides = turn_route.get("request_overrides") or {}
+            agent._pre_turn_intake_context = pre_turn_intake_context or None
+
+            _previous_tool_start_callback = getattr(agent, "tool_start_callback", None)
+            _previous_tool_complete_callback = getattr(agent, "tool_complete_callback", None)
+
+            def _checkpoint_tool_start(tool_call_id: str, tool_name: str, tool_args: dict) -> None:
+                if session_key:
+                    try:
+                        from agent import task_state as _task_state
+                        _activity = f"running {tool_name}"
+                        if tool_name == "delegate_task":
+                            _activity = "delegating part of the task"
+                        _task_state.update_turn_checkpoint(
+                            session_key=session_key,
+                            activity=_activity,
+                            tool_name=tool_name,
+                            tool_args=tool_args if isinstance(tool_args, dict) else {},
+                        )
+                    except Exception as _ckpt_err:
+                        logger.debug("turn checkpoint tool-start update failed: %s", _ckpt_err)
+                if _previous_tool_start_callback:
+                    _previous_tool_start_callback(tool_call_id, tool_name, tool_args)
+
+            def _checkpoint_tool_complete(
+                tool_call_id: str,
+                tool_name: str,
+                tool_args: dict,
+                tool_result: object,
+            ) -> None:
+                if session_key:
+                    try:
+                        from agent import task_state as _task_state
+                        _result_text = str(tool_result or "")
+                        _is_error = bool(
+                            _result_text.lower().startswith("error")
+                            or "\"error\"" in _result_text[:240].lower()
+                            or "timed out" in _result_text[:240].lower()
+                            or "timeout" in _result_text[:240].lower()
+                        )
+                        _task_state.update_turn_checkpoint(
+                            session_key=session_key,
+                            activity=f"finished {tool_name}",
+                            tool_name=tool_name,
+                            tool_args=tool_args if isinstance(tool_args, dict) else {},
+                            tool_result=tool_result,
+                            is_error=_is_error,
+                        )
+                    except Exception as _ckpt_err:
+                        logger.debug("turn checkpoint tool-complete update failed: %s", _ckpt_err)
+                if _previous_tool_complete_callback:
+                    _previous_tool_complete_callback(
+                        tool_call_id,
+                        tool_name,
+                        tool_args,
+                        tool_result,
+                    )
+
+            agent.tool_start_callback = _checkpoint_tool_start
+            agent.tool_complete_callback = _checkpoint_tool_complete
 
             _bg_review_release = threading.Event()
             _bg_review_pending: list[str] = []
@@ -13977,14 +14382,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
 
                 # Fallback: plain text approval prompt
-                cmd_preview = cmd[:200] + "..." if len(cmd) > 200 else cmd
-                msg = (
-                    f"⚠️ **Dangerous command requires approval:**\n"
-                    f"```\n{cmd_preview}\n```\n"
-                    f"Reason: {desc}\n\n"
-                    f"Reply `/approve` to execute, `/approve session` to approve this pattern "
-                    f"for the session, `/approve always` to approve permanently, or `/deny` to cancel."
-                )
+                msg = _format_gateway_exec_approval_prompt(cmd, desc)
                 try:
                     _approval_send_fut = safe_schedule_threadsafe(
                         _status_adapter.send(
@@ -14064,8 +14462,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message = (
                     f"[System note: Your previous turn in this session was interrupted "
                     f"by {_reason_phrase}. The conversation history below is intact. "
-                    f"If it contains unfinished tool result(s), process them first and "
-                    f"summarize what was accomplished, then address the user's new "
+                    f"Resume the interrupted work now. Do not only recap. Continue "
+                    f"to the next externally useful stopping point; if you cannot "
+                    f"continue, state the concrete blocker and the exact next "
+                    f"approval or input needed. If the history contains unfinished "
+                    f"tool result(s), process them before addressing the user's new "
                     f"message below.]\n\n"
                     + message
                 )
@@ -14125,6 +14526,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else:
                     _run_message = message
 
+                if session_key:
+                    try:
+                        from agent import task_state as _task_state
+                        _task_state.start_turn_checkpoint(
+                            session_key=session_key,
+                            session_id=session_id,
+                            user_message=message,
+                            source_message_id=str(event_message_id or ""),
+                        )
+                    except Exception as _ckpt_err:
+                        logger.debug("turn checkpoint start failed: %s", _ckpt_err)
+
                 _api_run_message = _wrap_current_message_with_observed_context(
                     _run_message,
                     observed_group_context,
@@ -14171,6 +14584,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             if not final_response:
                 error_msg = f"⚠️ {result['error']}" if result.get("error") else ""
+                if session_key:
+                    try:
+                        from agent import task_state as _task_state
+                        _task_state.finish_turn_checkpoint(
+                            session_key=session_key,
+                            status=(
+                                "interrupted"
+                                if result.get("interrupted")
+                                else "partial"
+                                if result.get("partial")
+                                else "failed"
+                            ),
+                            error=result.get("error") or error_msg,
+                            keep=True,
+                        )
+                    except Exception as _ckpt_err:
+                        logger.debug("turn checkpoint failure finish failed: %s", _ckpt_err)
                 return {
                     "final_response": error_msg,
                     "messages": result.get("messages", []),
@@ -14190,6 +14620,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "model": _resolved_model,
                     "context_length": _context_length,
                 }
+
+            if session_key:
+                try:
+                    from agent import task_state as _task_state
+                    _task_state.finish_turn_checkpoint(
+                        session_key=session_key,
+                        status="completed",
+                        final_response=final_response,
+                        keep=False,
+                    )
+                except Exception as _ckpt_err:
+                    logger.debug("turn checkpoint completion failed: %s", _ckpt_err)
             
             # Scan tool results for MEDIA:<path> tags that need to be delivered
             # as native audio/file attachments.  The TTS tool embeds MEDIA: tags
@@ -14302,7 +14744,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             task, exc,
                         )
                     maybe_auto_title_kwargs = {
-                        "failure_callback": _title_failure_cb,
+                        "failure_callback": None,
                         "main_runtime": {
                             "model": getattr(agent, "model", None),
                             "provider": getattr(agent, "provider", None),
@@ -14527,31 +14969,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # iteration counter is gated on busy_ack_detail so users
                 # who want it can opt in per platform.
                 _agent_ref = agent_holder[0]
-                _status_detail = ""
-                _want_iteration_detail = bool(
-                    resolve_display_setting(
-                        user_config,
-                        platform_key,
-                        "busy_ack_detail",
-                        True,
-                    )
-                )
+                _activity_summary = None
                 if _agent_ref and hasattr(_agent_ref, "get_activity_summary"):
                     try:
-                        _a = _agent_ref.get_activity_summary()
-                        _parts = []
-                        if _want_iteration_detail:
-                            _parts.append(
-                                f"iteration {_a['api_call_count']}/{_a['max_iterations']}"
-                            )
-                        _action = _a.get("current_tool") or _a.get("last_activity_desc")
-                        if _action:
-                            _parts.append(str(_action))
-                        if _parts:
-                            _status_detail = " — " + ", ".join(_parts)
+                        _activity_summary = _agent_ref.get_activity_summary()
                     except Exception:
                         pass
-                _heartbeat_text = f"⏳ Working — {_elapsed_mins} min{_status_detail}"
+                _heartbeat_text = _format_long_running_notice(_elapsed_mins, _activity_summary)
                 try:
                     _notify_res = None
                     if _heartbeat_msg_id:
@@ -14755,6 +15179,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "history_offset": 0,
                     "failed": True,
                 }
+                if session_key:
+                    try:
+                        from agent import task_state as _task_state
+                        _task_state.finish_turn_checkpoint(
+                            session_key=session_key,
+                            status="timeout",
+                            error="\n".join(_diag_lines),
+                            keep=True,
+                        )
+                    except Exception as _ckpt_err:
+                        logger.debug("turn checkpoint timeout finish failed: %s", _ckpt_err)
 
             # Track fallback model state: if the agent switched to a
             # fallback model during this run, persist it so /model shows
@@ -14909,7 +15344,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     adapter = self.adapters.get(source.platform)
                     if adapter and pending_event:
-                        merge_pending_message_event(adapter._pending_messages, session_key, pending_event)
+                        merge_pending_message_event(
+                            adapter._pending_messages,
+                            session_key,
+                            pending_event,
+                            merge_text=True,
+                        )
                     elif adapter and hasattr(adapter, 'queue_message'):
                         adapter.queue_message(session_key, pending)
                     return result_holder[0] or {"final_response": response, "messages": history}
@@ -15008,6 +15448,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     next_message_id = self._reply_anchor_for_event(pending_event)
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
 
+                next_provenance_units = self._provenance_units_for_prepared_event(
+                    pending_event,
+                    next_message,
+                )
+
                 # Restart typing indicator so the user sees activity while
                 # the follow-up turn runs.  The outer _process_message_background
                 # typing task is still alive but may be stale.
@@ -15032,6 +15477,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    provenance_units=next_provenance_units,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:

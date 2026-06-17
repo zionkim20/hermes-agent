@@ -202,19 +202,40 @@ class DeliveryRouter:
     ) -> Dict[str, Any]:
         """
         Deliver content to all specified targets.
-        
+
         Args:
             content: The message/output to deliver
             targets: List of delivery targets
             job_id: Optional job ID (for cron jobs)
             job_name: Optional job name
             metadata: Additional metadata to include
-        
+
         Returns:
             Dict with delivery results per target
         """
+        # NO_REPLY sentinel suppression — added 2026-06-02 by Zion.
+        # Mirrors the pattern in feishu_comment.py so capture-mode crons can end
+        # silently without leaking the literal "NO_REPLY" string to Slack/Telegram/etc.
+        # Local file delivery still proceeds so cron audit logs preserve the event.
+        if content is None or content.strip() == "" or content.strip() == "NO_REPLY":
+            logger.info(
+                "[Delivery] Skipping remote delivery — agent returned NO_REPLY sentinel or empty content (job=%s)",
+                job_name or job_id or "?"
+            )
+            results = {}
+            for target in targets:
+                if target.platform == Platform.LOCAL:
+                    try:
+                        result = self._deliver_local(content or "(no content)", job_id, job_name, metadata)
+                        results[target.to_string()] = {"success": True, "result": result}
+                    except Exception as e:
+                        results[target.to_string()] = {"success": False, "error": str(e)}
+                else:
+                    results[target.to_string()] = {"success": True, "skipped": "NO_REPLY sentinel"}
+            return results
+
         results = {}
-        
+
         for target in targets:
             try:
                 if target.platform == Platform.LOCAL:

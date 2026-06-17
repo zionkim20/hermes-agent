@@ -3909,6 +3909,28 @@ class TestPluginAPIAuth:
         resp = self.auth_client.get("/api/plugins/example/hello")
         assert resp.status_code == 200
 
+    def test_plugin_route_allows_agent_token(self, monkeypatch):
+        """Cloudflare service-token clients can use the long-lived agent header."""
+        monkeypatch.setenv("HERMES_AGENT_TOKEN", "test-agent-token")
+
+        resp = self.client.get(
+            "/api/plugins/example/hello",
+            headers={"X-Agent-Token": "test-agent-token"},
+        )
+
+        assert resp.status_code == 200
+
+    def test_dashboard_plugin_api_alias_allows_agent_token(self, monkeypatch):
+        """The CLI-facing /api/dashboard/plugins/<name>/api alias is mounted."""
+        monkeypatch.setenv("HERMES_AGENT_TOKEN", "test-agent-token")
+
+        resp = self.client.get(
+            "/api/dashboard/plugins/example/api/hello",
+            headers={"X-Agent-Token": "test-agent-token"},
+        )
+
+        assert resp.status_code == 200
+
     def test_plugin_post_requires_auth(self):
         """Plugin POST routes should return 401 without a valid session token."""
         resp = self.client.post("/api/plugins/kanban/tasks", json={"title": "test"})

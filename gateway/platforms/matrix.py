@@ -1346,10 +1346,12 @@ class MatrixAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         cmd_preview = command[:2000] + "..." if len(command) > 2000 else command
+        reason = description.strip() if description and description.strip().lower() != "dangerous command" else "this action changes something outside the chat"
         text = (
-            "⚠️ **Dangerous command requires approval**\n"
+            "**Approval needed before I continue**\n"
+            "I’m about to take an action outside this chat, so I need an explicit yes first.\n\n"
             f"```\n{cmd_preview}\n```\n"
-            f"Reason: {description}\n\n"
+            f"Reason: {reason}\n\n"
             "Reply `/approve` to execute, `/approve session` to approve this pattern for the session, "
             "`/approve always` to approve permanently, or `/deny` to cancel.\n\n"
             "You can also click the reaction to approve:\n"

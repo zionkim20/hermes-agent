@@ -314,6 +314,19 @@ def build_session_context_prompt(
             uid = _hash_sender_id(uid)
         lines.append(f"**User ID:** {uid}")
 
+    if context.source.chat_type in {"group", "channel", "thread"}:
+        lines.append(
+            "**Group turn-taking:** Distinguish an overheard group instruction "
+            "from a task for you. Default to no visible reply when people are "
+            "talking to each other, including direct instructions to another "
+            "participant. If a useful household-management fact should be kept, "
+            "capture it silently and reply with exactly `[SILENT]`. Treat an "
+            "@mention as permission to answer only the agent-relevant part, not "
+            "permission to restate everything in the chat. If the intended "
+            "recipient is already in the chat, do not offer to message them "
+            "externally and do not restate their instruction unless explicitly asked."
+        )
+
     # Platform-specific behavioral notes
     if context.source.platform == Platform.SLACK:
         lines.append("")

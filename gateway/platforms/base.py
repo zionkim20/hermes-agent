@@ -6,6 +6,7 @@ and implement the required methods.
 """
 
 import asyncio
+import hashlib
 import inspect
 import ipaddress
 import logging
@@ -173,6 +174,70 @@ def _custom_unit_to_cp(s: str, budget: int, len_fn) -> int:
         else:
             hi = mid - 1
     return lo
+
+
+def is_silent_response(response) -> bool:
+    """Return True when the agent intentionally requested no user-visible reply."""
+    text = str(response or "").strip()
+    return text.casefold() == "[silent]".casefold()
+
+
+_INTERNAL_PLANNING_EXACT_MARKERS = (
+    "need use terminal",
+    "need answer and perhaps",
+    "use memory? need durable",
+    "user says corrections",
+)
+
+_INTERNAL_PLANNING_CUES = (
+    "terminal",
+    "tool",
+    "pwd",
+    "df",
+    "calendar",
+    "flight",
+    "update memory",
+    "memory",
+    "durable",
+    "corrections",
+    "answer",
+    "perhaps",
+    "maybe",
+    "not sure",
+    "user says",
+    "should",
+    "option",
+)
+
+
+def looks_like_internal_planning_leak(response) -> bool:
+    """Return True for untagged scratchpad/planning text that should not ship.
+
+    Some models occasionally emit their internal task plan as plain assistant
+    prose instead of inside a reasoning tag. Keep this intentionally narrow:
+    suppress only short, cue-dense fragments that read like private execution
+    notes, not normal user-facing answers.
+    """
+    text = str(response or "").strip().replace("\u2589", "").strip()
+    if not text:
+        return False
+
+    lowered = " ".join(text.lower().split())
+    if any(marker in lowered for marker in _INTERNAL_PLANNING_EXACT_MARKERS):
+        return True
+
+    # Avoid eating normal terse replies like "Need shorter."
+    if len(text) < 80 and re.fullmatch(r"need\s+[\w\s.,!?'-]{1,60}", text, flags=re.I):
+        return False
+
+    starts_like_note = lowered.startswith(("need ", "important:"))
+    if not starts_like_note or len(text) > 1600:
+        return False
+
+    cue_count = sum(1 for cue in _INTERNAL_PLANNING_CUES if cue in lowered)
+    question_count = text.count("?")
+    sentence_count = max(1, len(re.findall(r"[.!?]", text)))
+    return cue_count >= 4 and (question_count >= 1 or sentence_count >= 3)
 
 
 def is_network_accessible(host: str) -> bool:
@@ -1457,6 +1522,11 @@ class MessageEvent:
     # from ``text`` so the sender-prefix logic in run.py can operate on the
     # trigger message alone, then prepend this context afterward.
     channel_context: Optional[str] = None
+
+    # Source-preserving message units used by pre-agent intake. The user-facing
+    # model text may still be merged, but capture should know which original
+    # inbound message each fact/action came from.
+    provenance_units: List[Dict[str, Any]] = field(default_factory=list)
     
     # Internal flag — set for synthetic events (e.g. background process
     # completion notifications) that must bypass user authorization checks.
@@ -1537,6 +1607,112 @@ def coerce_plaintext_gateway_command(event: "MessageEvent") -> None:
         return
 
 
+def _source_type_for_event(event: MessageEvent) -> str:
+    if event.message_type == MessageType.TEXT:
+        return 'user_text'
+    if event.message_type in {MessageType.VOICE, MessageType.AUDIO}:
+        return 'voice_transcript'
+    if event.message_type in {MessageType.PHOTO, MessageType.VIDEO}:
+        return 'image_caption'
+    if event.message_type == MessageType.DOCUMENT:
+        return 'document_caption'
+    return str(getattr(event.message_type, 'value', event.message_type) or 'unknown')
+
+
+def build_message_provenance_units(
+    event: MessageEvent,
+    *,
+    text_override: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    if event is None:
+        return []
+    existing = getattr(event, 'provenance_units', None)
+    if existing:
+        return [dict(unit) for unit in existing if isinstance(unit, dict)]
+
+    text_source = text_override if text_override is not None else getattr(event, 'text', None)
+    text = (text_source or '').strip()
+    if not text:
+        return []
+
+    source = getattr(event, 'source', None)
+    source_type = _source_type_for_event(event)
+    message_id = getattr(event, 'message_id', None)
+    timestamp = getattr(event, 'timestamp', None)
+    if hasattr(timestamp, 'isoformat'):
+        timestamp_value = timestamp.isoformat()
+    elif timestamp is not None:
+        timestamp_value = str(timestamp)
+    else:
+        timestamp_value = None
+    platform = getattr(getattr(source, 'platform', None), 'value', getattr(source, 'platform', None))
+    fallback_key = hashlib.sha256(
+        '\\0'.join(
+            str(part or '')
+            for part in (
+                platform,
+                getattr(source, 'chat_id', None),
+                getattr(source, 'user_id', None),
+                timestamp_value,
+                text,
+            )
+        ).encode('utf-8', 'ignore')
+    ).hexdigest()[:16]
+    source_message_id = str(message_id or 'provenance:' + fallback_key)
+
+    return [{
+        'unit_id': source_message_id,
+        'source_message_id': source_message_id,
+        'source_type': source_type,
+        'trusted_for_intake': source_type in {'user_text', 'voice_transcript', 'screenshot_chat_bubble'},
+        'sender_id': getattr(source, 'user_id', None),
+        'sender_name': getattr(source, 'user_name', None),
+        'channel': platform,
+        'chat_id': getattr(source, 'chat_id', None),
+        'timestamp': timestamp_value,
+        'text': text,
+    }]
+
+
+def _empty_message_provenance_unit(event: "MessageEvent") -> Dict[str, Any]:
+    source = getattr(event, "source", None)
+    source_type = _source_type_for_event(event)
+    message_id = getattr(event, "message_id", None)
+    timestamp = getattr(event, "timestamp", None)
+    if hasattr(timestamp, "isoformat"):
+        timestamp_value = timestamp.isoformat()
+    elif timestamp is not None:
+        timestamp_value = str(timestamp)
+    else:
+        timestamp_value = None
+    platform = getattr(getattr(source, "platform", None), "value", getattr(source, "platform", None))
+    fallback_key = hashlib.sha256(
+        "\0".join(
+            str(part or "")
+            for part in (
+                platform,
+                getattr(source, "chat_id", None),
+                getattr(source, "user_id", None),
+                timestamp_value,
+                source_type,
+            )
+        ).encode("utf-8", "ignore")
+    ).hexdigest()[:16]
+    source_message_id = str(message_id or f"provenance:{fallback_key}")
+    return {
+        "unit_id": source_message_id,
+        "source_message_id": source_message_id,
+        "source_type": source_type,
+        "trusted_for_intake": source_type in {"user_text", "voice_transcript", "screenshot_chat_bubble"},
+        "sender_id": getattr(source, "user_id", None),
+        "sender_name": getattr(source, "user_name", None),
+        "channel": platform,
+        "chat_id": getattr(source, "chat_id", None),
+        "timestamp": timestamp_value,
+        "text": "",
+    }
+
+
 @dataclass
 class SendResult:
     """Result of sending a message."""
@@ -1611,8 +1787,16 @@ def merge_pending_message_event(
     follow-ups so a multi-part user thought is not silently truncated to only
     the last queued fragment.
     """
+    def _ensure_units(message_event: MessageEvent) -> None:
+        if not getattr(message_event, 'provenance_units', None):
+            message_event.provenance_units = build_message_provenance_units(message_event)
+
     existing = pending_messages.get(session_key)
     if existing:
+        _ensure_units(existing)
+        incoming_units = build_message_provenance_units(event)
+        if not incoming_units and event.message_type in {MessageType.VOICE, MessageType.AUDIO}:
+            incoming_units = [_empty_message_provenance_unit(event)]
         existing_is_photo = getattr(existing, "message_type", None) == MessageType.PHOTO
         incoming_is_photo = event.message_type == MessageType.PHOTO
         existing_has_media = bool(existing.media_urls)
@@ -1623,6 +1807,7 @@ def merge_pending_message_event(
             existing.media_types.extend(event.media_types)
             if event.text:
                 existing.text = BasePlatformAdapter._merge_caption(existing.text, event.text)
+            existing.provenance_units.extend(incoming_units)
             return
 
         if existing_has_media or incoming_has_media:
@@ -1641,6 +1826,7 @@ def merge_pending_message_event(
                 and event.message_type != MessageType.TEXT
             ):
                 existing.message_type = event.message_type
+            existing.provenance_units.extend(incoming_units)
             return
 
         if (
@@ -1650,8 +1836,10 @@ def merge_pending_message_event(
         ):
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
+            existing.provenance_units.extend(incoming_units)
             return
 
+    _ensure_units(event)
     pending_messages[session_key] = event
 
 
@@ -4095,6 +4283,9 @@ class BasePlatformAdapter(ABC):
             # string, and remember the TTL + platform capability so the
             # post-send block can schedule the deletion.
             response, _ephemeral_ttl = self._unwrap_ephemeral(response)
+            if is_silent_response(response):
+                logger.debug("[%s] Handler returned [SILENT] for %s", self.name, event.source.chat_id)
+                response = None
 
             # Send response if any.  A None/empty response is normal when
             # streaming already delivered the text (already_sent=True) or
@@ -4139,6 +4330,13 @@ class BasePlatformAdapter(ABC):
                 # with an unknown extension is intentionally left in the body for
                 # extract_local_files below to pick up rather than silently dropped (#34517).
                 text_content = _strip_media_directives(text_content).strip()
+                if looks_like_internal_planning_leak(text_content):
+                    logger.warning(
+                        "[%s] Suppressing internal planning-looking response for %s",
+                        self.name,
+                        event.source.chat_id,
+                    )
+                    text_content = ""
                 if images:
                     logger.info("[%s] extract_images found %d image(s) in response (%d chars)", self.name, len(images), len(response))
 

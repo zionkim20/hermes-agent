@@ -738,6 +738,7 @@ class Task:
     body: Optional[str]
     assignee: Optional[str]
     status: str
+    kind: str
     priority: int
     created_by: Optional[str]
     created_at: int
@@ -801,6 +802,11 @@ class Task:
     # set the env var. Lets clients render a per-session board without
     # relying on tenant + time-window heuristics.
     session_id: Optional[str] = None
+    card_type: Optional[str] = None
+    mental_load_category: Optional[str] = None
+    visibility: Optional[str] = None
+    proposed_default: Optional[str] = None
+    source_message_id: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -820,6 +826,7 @@ class Task:
             body=row["body"],
             assignee=row["assignee"],
             status=row["status"],
+            kind=row["kind"] if "kind" in keys else "engineering",
             priority=row["priority"],
             created_by=row["created_by"],
             created_at=row["created_at"],
@@ -875,6 +882,17 @@ class Task:
             ),
             session_id=(
                 row["session_id"] if "session_id" in keys else None
+            ),
+            card_type=row["card_type"] if "card_type" in keys else None,
+            mental_load_category=(
+                row["mental_load_category"] if "mental_load_category" in keys else None
+            ),
+            visibility=row["visibility"] if "visibility" in keys else None,
+            proposed_default=(
+                row["proposed_default"] if "proposed_default" in keys else None
+            ),
+            source_message_id=(
+                row["source_message_id"] if "source_message_id" in keys else None
             ),
         )
 
@@ -977,6 +995,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     body                 TEXT,
     assignee             TEXT,
     status               TEXT NOT NULL,
+    kind                 TEXT NOT NULL DEFAULT 'engineering',
     priority             INTEGER DEFAULT 0,
     created_by           TEXT,
     created_at           INTEGER NOT NULL,
@@ -1037,7 +1056,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- for tasks created from the CLI, dashboard, or any path that doesn't
     -- set the env var. Indexed so per-session list queries stay cheap on
     -- larger boards.
-    session_id           TEXT
+    session_id           TEXT,
+    card_type            TEXT,
+    mental_load_category TEXT,
+    visibility           TEXT,
+    proposed_default     TEXT,
+    source_message_id    TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1585,6 +1609,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(conn, "tasks", "result", "result TEXT")
     if "branch_name" not in cols:
         _add_column_if_missing(conn, "tasks", "branch_name", "branch_name TEXT")
+    if "kind" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "kind", "kind TEXT NOT NULL DEFAULT 'engineering'"
+        )
     if "idempotency_key" not in cols:
         _add_column_if_missing(
             conn, "tasks", "idempotency_key", "idempotency_key TEXT"
@@ -1707,6 +1735,23 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
     )
+
+    if "card_type" not in cols:
+        _add_column_if_missing(conn, "tasks", "card_type", "card_type TEXT")
+    if "mental_load_category" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "mental_load_category", "mental_load_category TEXT"
+        )
+    if "visibility" not in cols:
+        _add_column_if_missing(conn, "tasks", "visibility", "visibility TEXT")
+    if "proposed_default" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "proposed_default", "proposed_default TEXT"
+        )
+    if "source_message_id" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "source_message_id", "source_message_id TEXT"
+        )
 
     # task_events gained a run_id column; back-fill it as NULL for
     # historical events (they predate runs and can't be attributed).
@@ -2061,6 +2106,7 @@ def create_task(
     branch_name: Optional[str] = None,
     tenant: Optional[str] = None,
     priority: int = 0,
+    kind: str = "engineering",
     parents: Iterable[str] = (),
     triage: bool = False,
     idempotency_key: Optional[str] = None,
@@ -2113,6 +2159,8 @@ def create_task(
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
+    if kind not in {"engineering", "household"}:
+        raise ValueError("kind must be one of ['engineering', 'household']")
     parents = tuple(p for p in parents if p)
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
@@ -2233,7 +2281,7 @@ def create_task(
                 conn.execute(
                     """
                     INSERT INTO tasks (
-                        id, title, body, assignee, status, priority,
+                        id, title, body, assignee, status, priority, kind,
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, tenant, idempotency_key, max_runtime_seconds,
                         skills, max_retries, goal_mode, goal_max_turns, session_id
@@ -2246,6 +2294,7 @@ def create_task(
                         assignee,
                         task_status,
                         priority,
+                        kind,
                         created_by,
                         now,
                         workspace_kind,
@@ -2273,6 +2322,7 @@ def create_task(
                     {
                         "assignee": assignee,
                         "status": task_status,
+                        "kind": kind,
                         "parents": list(parents),
                         "tenant": tenant,
                         "branch_name": branch_name,
@@ -4514,9 +4564,9 @@ def decompose_triage_task(
                 child_ws_path = None
             conn.execute(
                 "INSERT INTO tasks "
-                "(id, title, body, assignee, status, workspace_kind, "
+                "(id, title, body, assignee, status, kind, workspace_kind, "
                 " workspace_path, tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, 'todo', 'engineering', ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,

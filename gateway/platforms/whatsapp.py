@@ -343,6 +343,14 @@ class WhatsAppAdapter(BasePlatformAdapter):
             return bool(configured)
         return os.getenv("WHATSAPP_REQUIRE_MENTION", "false").lower() in {"true", "1", "yes", "on"}
 
+    def _whatsapp_observe_unaddressed_groups(self) -> bool:
+        configured = self.config.extra.get("observe_unaddressed_groups")
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() in {"true", "1", "yes", "on"}
+            return bool(configured)
+        return os.getenv("WHATSAPP_OBSERVE_UNADDRESSED_GROUPS", "false").lower() in {"true", "1", "yes", "on"}
+
     def _whatsapp_free_response_chats(self) -> set[str]:
         raw = self.config.extra.get("free_response_chats")
         if raw is None:
@@ -527,6 +535,18 @@ class WhatsAppAdapter(BasePlatformAdapter):
         if self._message_mentions_bot(data):
             return True
         return self._message_matches_mention_patterns(data)
+
+    def _should_observe_message(self, data: Dict[str, Any]) -> bool:
+        if not self._whatsapp_observe_unaddressed_groups():
+            return False
+        chat_id = str(data.get("chatId") or "")
+        if self._is_broadcast_chat(chat_id):
+            return False
+        if not data.get("isGroup", False):
+            return False
+        if not self._is_group_allowed(chat_id):
+            return False
+        return not self._should_process_message(data)
     
     async def connect(self) -> bool:
         """
@@ -1261,8 +1281,12 @@ class WhatsAppAdapter(BasePlatformAdapter):
     async def _build_message_event(self, data: Dict[str, Any]) -> Optional[MessageEvent]:
         """Build a MessageEvent from bridge message data, downloading images to cache."""
         try:
+            observe_only = False
             if not self._should_process_message(data):
-                return None
+                if not self._should_observe_message(data):
+                    return None
+                data = {**data, "_hermes_observe_only": True}
+                observe_only = True
 
             # Determine message type
             msg_type = MessageType.TEXT
@@ -1341,11 +1365,35 @@ class WhatsAppAdapter(BasePlatformAdapter):
                     cached_urls.append(url)
                     media_types.append("unknown")
 
+            quoted_body = str(data.get("quotedBody") or "").strip()
+            quoted_media_type = str(data.get("quotedMediaType") or "").strip().lower()
+            quoted_media_urls = data.get("quotedMediaUrls") or []
+            reply_to_text = quoted_body or None
+            if quoted_media_type in {"audio", "ptt"}:
+                reply_to_text = quoted_body or "[quoted voice message]"
+                for url in quoted_media_urls:
+                    if isinstance(url, str) and url.startswith(("http://", "https://")):
+                        try:
+                            cached_path = await cache_audio_from_url(url, ext=".ogg")
+                            cached_urls.append(cached_path)
+                            media_types.append("audio/ogg")
+                            print(f"[{self.name}] Cached quoted voice: {cached_path}", flush=True)
+                        except Exception as e:
+                            print(f"[{self.name}] Failed to cache quoted voice: {e}", flush=True)
+                            cached_urls.append(url)
+                            media_types.append("audio/ogg")
+                    elif isinstance(url, str) and os.path.isabs(url):
+                        cached_urls.append(url)
+                        media_types.append("audio/ogg")
+                        print(f"[{self.name}] Using bridge-cached quoted audio: {url}", flush=True)
+            elif quoted_media_type and not reply_to_text:
+                reply_to_text = f"[quoted {quoted_media_type} message]"
+
             # For text-readable documents, inject file content directly into
             # the message text so the agent can read it inline.
             # Cap at 100KB to match Telegram/Discord/Slack behaviour.
             body = data.get("body", "")
-            if data.get("isGroup"):
+            if data.get("isGroup") and not observe_only:
                 body = self._clean_bot_mention_text(body, data)
             MAX_TEXT_INJECT_BYTES = 100 * 1024
             if msg_type == MessageType.DOCUMENT and cached_urls:
@@ -1380,6 +1428,8 @@ class WhatsAppAdapter(BasePlatformAdapter):
                 source=source,
                 raw_message=data,
                 message_id=data.get("messageId"),
+                reply_to_message_id=data.get("quotedMessageId"),
+                reply_to_text=reply_to_text,
                 media_urls=cached_urls,
                 media_types=media_types,
             )

@@ -381,7 +381,7 @@ class TestGatewaySurfacesNullResponse:
             agent_result, response, history_len=60,
         )
 
-        assert "context window" in response
+        assert "chat has gotten too long" in response
         assert "/compact" in response
 
     def test_failed_generic_error(self):

@@ -4298,12 +4298,16 @@ class DiscordAdapter(BasePlatformAdapter):
             # Discord embed description limit is 4096; show full command up to that
             max_desc = 4088
             cmd_display = command if len(command) <= max_desc else command[: max_desc - 3] + "..."
+            reason = description.strip() if description and description.strip().lower() != "dangerous command" else "this action changes something outside the chat"
             embed = discord.Embed(
-                title="⚠️ Command Approval Required",
-                description=f"```\n{cmd_display}\n```",
+                title="Approval needed before I continue",
+                description=(
+                    "I’m about to take an action outside this chat, so I need an explicit yes first.\n\n"
+                    f"```\n{cmd_display}\n```"
+                ),
                 color=discord.Color.orange(),
             )
-            embed.add_field(name="Reason", value=description, inline=False)
+            embed.add_field(name="Reason", value=reason, inline=False)
 
             view = ExecApprovalView(
                 session_key=session_key,

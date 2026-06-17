@@ -2676,10 +2676,12 @@ class TelegramAdapter(BasePlatformAdapter):
 
         try:
             cmd_preview = command[:3800] + "..." if len(command) > 3800 else command
+            reason = description.strip() if description and description.strip().lower() != "dangerous command" else "this action changes something outside the chat"
             text = (
-                f"⚠️ <b>Command Approval Required</b>\n\n"
+                f"<b>Approval needed before I continue</b>\n\n"
+                f"I’m about to take an action outside this chat, so I need an explicit yes first.\n\n"
                 f"<pre>{_html.escape(cmd_preview)}</pre>\n\n"
-                f"Reason: {_html.escape(description)}"
+                f"Reason: {_html.escape(reason)}"
             )
 
             # Resolve thread context for thread replies

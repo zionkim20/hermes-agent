@@ -182,6 +182,7 @@ app = FastAPI(title="Hermes Agent", version=__version__, lifespan=_lifespan)
 # ---------------------------------------------------------------------------
 _SESSION_TOKEN = os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN") or secrets.token_urlsafe(32)
 _SESSION_HEADER_NAME = "X-Hermes-Session-Token"
+_AGENT_TOKEN_HEADER_NAME = "X-Agent-Token"
 
 # In-browser Chat tab (/chat, /api/pty, /api/ws, …).  Always enabled: the
 # desktop app and the dashboard's own Chat tab both drive the agent over the
@@ -245,9 +246,17 @@ def _has_valid_session_token(request: Request) -> bool:
     return hmac.compare_digest(auth.encode(), expected.encode())
 
 
+def _has_valid_agent_token(request: Request) -> bool:
+    agent_token = os.environ.get("HERMES_AGENT_TOKEN", "")
+    if not agent_token:
+        return False
+    supplied = request.headers.get(_AGENT_TOKEN_HEADER_NAME, "")
+    return hmac.compare_digest(supplied.encode(), agent_token.encode())
+
+
 def _require_token(request: Request) -> None:
-    """Validate the ephemeral session token.  Raises 401 on mismatch."""
-    if not _has_valid_session_token(request):
+    """Validate the ephemeral session token or long-lived agent token. Raises 401 on mismatch."""
+    if not (_has_valid_session_token(request) or _has_valid_agent_token(request)):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
@@ -377,7 +386,7 @@ async def auth_middleware(request: Request, call_next):
         return await call_next(request)
     path = request.url.path
     if path.startswith("/api/") and path not in _PUBLIC_API_PATHS:
-        if not _has_valid_session_token(request):
+        if not (_has_valid_session_token(request) or _has_valid_agent_token(request)):
             return JSONResponse(
                 status_code=401,
                 content={"detail": "Unauthorized"},
@@ -10015,7 +10024,12 @@ def _mount_plugin_api_routes():
                 _log.warning("Plugin %s api file has no 'router' attribute", plugin["name"])
                 continue
             app.include_router(router, prefix=f"/api/plugins/{plugin['name']}")
-            _log.info("Mounted plugin API routes: /api/plugins/%s/", plugin["name"])
+            app.include_router(router, prefix=f"/api/dashboard/plugins/{plugin['name']}/api")
+            _log.info(
+                "Mounted plugin API routes: /api/plugins/%s/ and /api/dashboard/plugins/%s/api/",
+                plugin["name"],
+                plugin["name"],
+            )
         except Exception as exc:
             _log.warning("Failed to load plugin %s API routes: %s", plugin["name"], exc)
 

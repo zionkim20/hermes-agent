@@ -1880,6 +1880,7 @@ class FeishuAdapter(BasePlatformAdapter):
         try:
             approval_id = next(self._approval_counter)
             cmd_preview = command[:3000] + "..." if len(command) > 3000 else command
+            reason = description.strip() if description and description.strip().lower() != "dangerous command" else "this action changes something outside the chat"
 
             def _btn(label: str, action_name: str, btn_type: str = "default") -> dict:
                 return {
@@ -1892,13 +1893,16 @@ class FeishuAdapter(BasePlatformAdapter):
             card = {
                 "config": {"wide_screen_mode": True},
                 "header": {
-                    "title": {"content": "⚠️ Command Approval Required", "tag": "plain_text"},
+                    "title": {"content": "Approval needed before I continue", "tag": "plain_text"},
                     "template": "orange",
                 },
                 "elements": [
                     {
                         "tag": "markdown",
-                        "content": f"```\n{cmd_preview}\n```\n**Reason:** {description}",
+                        "content": (
+                            "I’m about to take an action outside this chat, so I need an explicit yes first.\n\n"
+                            f"```\n{cmd_preview}\n```\n**Reason:** {reason}"
+                        ),
                     },
                     {
                         "tag": "action",

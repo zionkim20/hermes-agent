@@ -51,6 +51,104 @@ def _make_large_history_tokens(target_tokens: int) -> list:
     return _make_history(n_msgs, content_size=content_size)
 
 
+def test_gateway_status_filter_suppresses_runtime_diagnostics():
+    gateway_run = importlib.import_module("gateway.run")
+
+    assert gateway_run._gateway_user_status_message(
+        "lifecycle",
+        "⚠ Configured auxiliary compression provider 'openrouter' is unavailable — context compression will drop middle turns without a summary.",
+    ) is None
+    assert gateway_run._gateway_user_status_message(
+        "lifecycle",
+        "Preflight compression deferred: ~209,739 tokens >= 204,000 threshold.",
+    ) == "I’m keeping everything together while I work."
+    assert gateway_run._gateway_user_status_message(
+        "progress",
+        "Still working... (3 min elapsed)",
+    ) == "Still working... (3 min elapsed)"
+
+
+def test_gateway_interim_filter_suppresses_internal_planning_scratchpad():
+    gateway_run = importlib.import_module("gateway.run")
+
+    leaked = (
+        "Need perhaps create cron? User says need system once a week. "
+        "Could set cron weekly to prepare list. Need log."
+    )
+
+    assert gateway_run._gateway_user_interim_message(leaked) is None
+    assert gateway_run._gateway_user_interim_message("Need log.") is None
+
+
+def test_gateway_interim_filter_allows_plain_progress_commentary():
+    gateway_run = importlib.import_module("gateway.run")
+
+    assert (
+        gateway_run._gateway_user_interim_message("I’ll check the calendar first.")
+        == "I’ll check the calendar first."
+    )
+
+
+def test_resume_status_response_replaces_jargon_with_user_safe_language():
+    gateway_run = importlib.import_module("gateway.run")
+
+    response = gateway_run._normalize_resume_continuation_response(
+        "I had to restart my working context — I still have your latest message."
+    )
+
+    assert response == "I’m picking this back up now and continuing from your latest message."
+    assert "working context" not in response.casefold()
+    assert "working state" not in response.casefold()
+
+
+def test_gateway_approval_prompt_uses_household_safe_tone():
+    gateway_run = importlib.import_module("gateway.run")
+
+    prompt = gateway_run._format_gateway_exec_approval_prompt(
+        "python book_vendor.py",
+        "dangerous command",
+    )
+
+    assert "Approval needed before I continue" in prompt
+    assert "dangerous command" not in prompt.lower()
+    assert "python book_vendor.py" in prompt
+    assert "/approve" in prompt
+
+
+def test_long_running_notice_keeps_elapsed_time_without_runtime_internals():
+    gateway_run = importlib.import_module("gateway.run")
+
+    notice = gateway_run._format_long_running_notice(
+        3,
+        {
+            "api_call_count": 8,
+            "max_iterations": 90,
+            "current_tool": "delegate_task",
+        },
+    )
+
+    assert notice == "Still working... 3 min elapsed — checking this in the background."
+    assert "iteration" not in notice
+    assert "delegate_task" not in notice
+
+
+def test_long_running_notice_sanitizes_streaming_activity():
+    gateway_run = importlib.import_module("gateway.run")
+
+    notice = gateway_run._format_long_running_notice(
+        7,
+        {
+            "api_call_count": 12,
+            "max_iterations": 90,
+            "current_tool": "",
+            "last_activity_desc": "receiving stream response",
+        },
+    )
+
+    assert notice == "Still working... 7 min elapsed — working through the response."
+    assert "receiving stream response" not in notice
+
+
 class HygieneCaptureAdapter(BasePlatformAdapter):
     def __init__(self):
         super().__init__(PlatformConfig(enabled=True, token="fake-token"), Platform.TELEGRAM)
@@ -398,10 +496,8 @@ async def test_session_hygiene_messages_stay_in_originating_topic(monkeypatch, t
 @pytest.mark.asyncio
 async def test_session_hygiene_warns_user_when_compression_aborts(monkeypatch, tmp_path):
     """When auxiliary compression's summary LLM call fails, the compressor
-    ABORTS — returns messages unchanged, sets _last_compress_aborted=True,
-    and drops nothing.  Gateway must surface a visible ⚠️ warning to the
-    user (including thread_id metadata so it lands in the originating
-    topic/thread) saying the conversation is unchanged and how to retry."""
+    inserts a static fallback and the dropped turns are unrecoverable. The
+    gateway must not leak provider/config diagnostics into household chat."""
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
@@ -496,20 +592,7 @@ async def test_session_hygiene_warns_user_when_compression_aborts(monkeypatch, t
     result = await runner._handle_message(event)
 
     assert result == "ok"
-    # The compressor reported abort → exactly one warning message must
-    # have been delivered to the user.
-    warning_messages = [s for s in adapter.sent if "Context compression aborted" in s["content"]]
-    assert len(warning_messages) == 1, (
-        f"Expected 1 compression-aborted warning, got {len(warning_messages)}: {adapter.sent}"
-    )
-    warn = warning_messages[0]
-    # Warning must include the underlying error and tell the user nothing
-    # was dropped.
-    assert "404" in warn["content"]
-    assert "No messages were dropped" in warn["content"]
-    # Warning must land in the originating topic/thread, not the main channel.
-    assert warn["chat_id"] == "-1001"
-    assert warn["metadata"] == {"thread_id": "17585"}
+    assert adapter.sent == []
 
     FakeCompressAgentWithSummaryFailure.last_instance.close.assert_called_once()
 
@@ -517,10 +600,8 @@ async def test_session_hygiene_warns_user_when_compression_aborts(monkeypatch, t
 @pytest.mark.asyncio
 async def test_session_hygiene_informs_user_when_aux_model_fails_but_recovers(monkeypatch, tmp_path):
     """When the user's configured ``auxiliary.compression.model`` errors out
-    and we recover via the main model, compression succeeds but the user's
-    config is still broken.  Gateway hygiene must surface an ℹ note so the
-    user knows to fix ``auxiliary.compression.model`` — silent recovery
-    hides a misconfig only they can resolve."""
+    and we recover via the main model, compression succeeds but the provider
+    diagnostic should stay in ops logs, not the household chat."""
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
@@ -616,24 +697,7 @@ async def test_session_hygiene_informs_user_when_aux_model_fails_but_recovers(mo
     result = await runner._handle_message(event)
 
     assert result == "ok"
-    # No ⚠️ hard-failure warning (that's for dropped turns)
-    hard_warnings = [s for s in adapter.sent if "Context compression summary failed" in s["content"]]
-    assert len(hard_warnings) == 0, adapter.sent
-    # But an ℹ note about the configured aux model must be delivered.
-    aux_notes = [
-        s for s in adapter.sent
-        if "Configured compression model" in s["content"]
-    ]
-    assert len(aux_notes) == 1, (
-        f"Expected 1 aux-model fallback notice, got {len(aux_notes)}: {adapter.sent}"
-    )
-    note = aux_notes[0]
-    assert "gemini-3-flash-preview" in note["content"]
-    assert "404" in note["content"]
-    assert "auxiliary.compression.model" in note["content"]
-    # Note must land in the originating topic/thread.
-    assert note["chat_id"] == "-1001"
-    assert note["metadata"] == {"thread_id": "17585"}
+    assert adapter.sent == []
 
     FakeCompressAgentWithAuxRecovery.last_instance.close.assert_called_once()
 

@@ -271,10 +271,11 @@ class TestBuildJobPromptScansSkillContent:
             "prompt": "run task",
             "skills": ["does-not-exist"],
         }
-        # Should not raise — missing skills are skipped with a notice.
+        # Should not raise — missing skills are skipped in logs only.
         prompt = scheduler._build_job_prompt(job)
         assert prompt is not None
-        assert "could not be found" in prompt
+        assert "could not be found" not in prompt
+        assert "does-not-exist" not in prompt
 
     def test_skill_bundle_in_job_skills_loads_referenced_skills(self, cron_env):
         hermes_home, scheduler = cron_env

@@ -2367,17 +2367,39 @@ class TestReactions:
         assert len(add_calls) == 1
         assert add_calls[0].kwargs["name"] == "eyes"
 
-        # Simulate the base class calling on_processing_complete
+        # Simulate the base class calling on_processing_complete while the
+        # session still has a queued follow-up. The green checkmark must wait
+        # until the full thread chain is closed, not just the current turn.
         from gateway.platforms.base import ProcessingOutcome
-
+        from gateway.session import build_session_key
+        session_key = build_session_key(source)
+        follow_event = MessageEvent(
+            text="follow-up",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="1234567890.000004",
+        )
+        adapter._pending_messages[session_key] = follow_event
         await adapter.on_processing_complete(msg_event, ProcessingOutcome.SUCCESS)
 
         add_calls = adapter._app.client.reactions_add.call_args_list
         remove_calls = adapter._app.client.reactions_remove.call_args_list
-        assert len(add_calls) == 2
+        assert len(add_calls) == 1
+        assert len(remove_calls) == 0
+        assert "1234567890.000001" not in adapter._reacting_message_ids
+
+        # Once there is no queued follow-up, the thread is fully closed and the
+        # success reaction can be applied.
+        del adapter._pending_messages[session_key]
+        adapter._reacting_message_ids.add("1234567890.000004")
+        await adapter.on_processing_complete(follow_event, ProcessingOutcome.SUCCESS)
+
+        add_calls = adapter._app.client.reactions_add.call_args_list
+        assert len(add_calls) == 3
         assert add_calls[1].kwargs["name"] == "white_check_mark"
-        assert len(remove_calls) == 1
-        assert remove_calls[0].kwargs["name"] == "eyes"
+        assert add_calls[1].kwargs["timestamp"] == "1234567890.000001"
+        assert add_calls[2].kwargs["name"] == "white_check_mark"
+        assert add_calls[2].kwargs["timestamp"] == "1234567890.000004"
 
         # Message ID should be cleaned up
         assert "1234567890.000001" not in adapter._reacting_message_ids

@@ -146,6 +146,64 @@ function getContextInfo(messageContent) {
   return {};
 }
 
+async function extractQuotedMessagePayload(contextInfo, fallbackChatId) {
+  const quotedMessage = contextInfo?.quotedMessage;
+  if (!quotedMessage) {
+    return { quotedBody: '', quotedMediaType: '', quotedMediaUrls: [] };
+  }
+
+  const quotedContent = getMessageContent({ message: quotedMessage });
+  const quotedMessageId = contextInfo?.stanzaId || null;
+  const quotedParticipant = normalizeWhatsAppId(contextInfo?.participant || '') || null;
+  const quotedRemoteJid = normalizeWhatsAppId(contextInfo?.remoteJid || '') || fallbackChatId;
+  let quotedBody = '';
+  let quotedMediaType = '';
+  const quotedMediaUrls = [];
+
+  if (quotedContent.conversation) {
+    quotedBody = quotedContent.conversation;
+  } else if (quotedContent.extendedTextMessage?.text) {
+    quotedBody = quotedContent.extendedTextMessage.text;
+  } else if (quotedContent.imageMessage) {
+    quotedBody = quotedContent.imageMessage.caption || '';
+    quotedMediaType = 'image';
+  } else if (quotedContent.videoMessage) {
+    quotedBody = quotedContent.videoMessage.caption || '';
+    quotedMediaType = 'video';
+  } else if (quotedContent.audioMessage || quotedContent.pttMessage) {
+    quotedMediaType = quotedContent.pttMessage ? 'ptt' : 'audio';
+    try {
+      const quotedMsg = {
+        key: {
+          id: quotedMessageId || undefined,
+          remoteJid: quotedRemoteJid || fallbackChatId,
+          participant: quotedParticipant || undefined,
+        },
+        message: quotedContent,
+      };
+      const audioMsg = quotedContent.pttMessage || quotedContent.audioMessage;
+      const buf = await downloadMediaMessage(quotedMsg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
+      const mime = audioMsg.mimetype || 'audio/ogg';
+      const ext = mime.includes('ogg') ? '.ogg' : mime.includes('mp4') ? '.m4a' : '.ogg';
+      mkdirSync(AUDIO_CACHE_DIR, { recursive: true });
+      const filePath = path.join(AUDIO_CACHE_DIR, `quoted_aud_${randomBytes(6).toString('hex')}${ext}`);
+      writeFileSync(filePath, buf);
+      quotedMediaUrls.push(filePath);
+    } catch (err) {
+      console.error('[bridge] Failed to download quoted audio:', err.message);
+    }
+  } else if (quotedContent.documentMessage) {
+    quotedBody = quotedContent.documentMessage.caption || quotedContent.documentMessage.fileName || '';
+    quotedMediaType = 'document';
+  }
+
+  if (quotedMediaType && !quotedBody) {
+    quotedBody = `[quoted ${quotedMediaType} message]`;
+  }
+
+  return { quotedBody, quotedMediaType, quotedMediaUrls };
+}
+
 mkdirSync(SESSION_DIR, { recursive: true });
 
 // Build LID → phone reverse map from session files (lid-mapping-{phone}.json)
@@ -321,6 +379,7 @@ async function startSocket() {
       const quotedParticipant = normalizeWhatsAppId(contextInfo?.participant || '') || null;
       const quotedRemoteJid = normalizeWhatsAppId(contextInfo?.remoteJid || '') || null;
       const hasQuotedMessage = !!contextInfo?.quotedMessage;
+      const quotedPayload = await extractQuotedMessagePayload(contextInfo, chatId);
 
       // Extract message body
       let body = '';
@@ -436,6 +495,9 @@ async function startSocket() {
         quotedParticipant,
         quotedRemoteJid,
         hasQuotedMessage,
+        quotedBody: quotedPayload.quotedBody,
+        quotedMediaType: quotedPayload.quotedMediaType,
+        quotedMediaUrls: quotedPayload.quotedMediaUrls,
         botIds,
         timestamp: msg.messageTimestamp,
       };

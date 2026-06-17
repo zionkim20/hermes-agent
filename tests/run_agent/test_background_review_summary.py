@@ -112,6 +112,29 @@ def test_added_message_relabels_by_target():
     assert actions == ["Memory updated"]
 
 
+def test_added_memory_includes_saved_entry_detail():
+    review_messages = [
+        _tool_msg(
+            "c1",
+            {
+                "success": True,
+                "message": "Entry added.",
+                "target": "user",
+                "entries": [
+                    "Prefers concise replies.",
+                    "When runtime status is shown, keep it user-facing and explain what was saved.",
+                ],
+            },
+        )
+    ]
+
+    actions = _summarize(review_messages, [])
+
+    assert actions == [
+        "User profile updated: When runtime status is shown, keep it user-facing and explain what was saved."
+    ]
+
+
 def test_removed_or_replaced_relabels_by_target():
     review_messages = [
         _tool_msg(

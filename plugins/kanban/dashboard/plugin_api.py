@@ -583,6 +583,7 @@ class CreateTaskBody(BaseModel):
     assignee: Optional[str] = None
     tenant: Optional[str] = None
     priority: int = 0
+    kind: str = "engineering"
     workspace_kind: str = "scratch"
     workspace_path: Optional[str] = None
     parents: list[str] = Field(default_factory=list)
@@ -609,6 +610,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             workspace_path=payload.workspace_path,
             tenant=payload.tenant,
             priority=payload.priority,
+            kind=payload.kind,
             parents=payload.parents,
             triage=payload.triage,
             idempotency_key=payload.idempotency_key,
@@ -807,6 +809,7 @@ class UpdateTaskBody(BaseModel):
     status: Optional[str] = None
     assignee: Optional[str] = None
     priority: Optional[int] = None
+    kind: Optional[str] = None
     title: Optional[str] = None
     body: Optional[str] = None
     result: Optional[str] = None
@@ -907,6 +910,21 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     "VALUES (?, 'reprioritized', ?, ?)",
                     (task_id, json.dumps({"priority": int(payload.priority)}),
                      int(time.time())),
+                )
+
+        # --- kind ---------------------------------------------------------
+        if payload.kind is not None:
+            if payload.kind not in {"engineering", "household"}:
+                raise HTTPException(status_code=400, detail="kind must be engineering or household")
+            with kanban_db.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET kind = ? WHERE id = ?",
+                    (payload.kind, task_id),
+                )
+                conn.execute(
+                    "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                    "VALUES (?, 'kind_changed', ?, ?)",
+                    (task_id, json.dumps({"kind": payload.kind}), int(time.time())),
                 )
 
         # --- title / body -------------------------------------------------
@@ -1151,6 +1169,7 @@ class BulkTaskBody(BaseModel):
     status: Optional[str] = None
     assignee: Optional[str] = None  # "" or None = unassign
     priority: Optional[int] = None
+    kind: Optional[str] = None
     archive: bool = False
     result: Optional[str] = None
     summary: Optional[str] = None
@@ -1247,6 +1266,20 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                             (tid, json.dumps({"priority": int(payload.priority)}),
                              int(time.time())),
                         )
+                if payload.kind is not None:
+                    if payload.kind not in {"engineering", "household"}:
+                        entry.update(ok=False, error="kind must be engineering or household")
+                    else:
+                        with kanban_db.write_txn(conn):
+                            conn.execute(
+                                "UPDATE tasks SET kind = ? WHERE id = ?",
+                                (payload.kind, tid),
+                            )
+                            conn.execute(
+                                "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                                "VALUES (?, 'kind_changed', ?, ?)",
+                                (tid, json.dumps({"kind": payload.kind}), int(time.time())),
+                            )
             except Exception as e:  # defensive — one bad id shouldn't kill the batch
                 entry.update(ok=False, error=str(e))
             results.append(entry)

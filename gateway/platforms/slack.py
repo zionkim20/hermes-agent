@@ -50,6 +50,7 @@ from gateway.platforms.base import (
     safe_url_for_log,
     cache_document_from_bytes,
 )
+from gateway.session import build_session_key
 
 
 logger = logging.getLogger(__name__)
@@ -355,6 +356,7 @@ class SlackAdapter(BasePlatformAdapter):
         self._THREAD_CACHE_TTL = 60.0
         # Track message IDs that should get reaction lifecycle (DMs / @mentions).
         self._reacting_message_ids: set = set()
+        self._deferred_success_reactions: Dict[str, List[Tuple[str, str]]] = {}
         # Track active assistant thread status indicators so stop_typing can
         # clear them (chat_id → thread_ts).
         self._active_status_threads: Dict[str, str] = {}
@@ -1665,12 +1667,27 @@ class SlackAdapter(BasePlatformAdapter):
         ts = getattr(event, "message_id", None)
         if not ts or ts not in self._reacting_message_ids:
             return
-        self._reacting_message_ids.discard(ts)
         channel_id = getattr(event.source, "chat_id", None)
         if not channel_id:
             return
+        session_key = build_session_key(
+            event.source,
+            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+        )
+        pending_message = getattr(self, "_pending_messages", {}).get(session_key)
+        if pending_message is not None:
+            if outcome == ProcessingOutcome.SUCCESS:
+                self._reacting_message_ids.discard(ts)
+                deferred = self._deferred_success_reactions.setdefault(session_key, [])
+                if (channel_id, ts) not in deferred:
+                    deferred.append((channel_id, ts))
+            return
+        self._reacting_message_ids.discard(ts)
         await self._remove_reaction(channel_id, ts, "eyes")
         if outcome == ProcessingOutcome.SUCCESS:
+            for deferred_channel_id, deferred_ts in self._deferred_success_reactions.pop(session_key, []):
+                await self._add_reaction(deferred_channel_id, deferred_ts, "white_check_mark")
             await self._add_reaction(channel_id, ts, "white_check_mark")
         elif outcome == ProcessingOutcome.FAILURE:
             await self._add_reaction(channel_id, ts, "x")
@@ -2693,6 +2710,7 @@ class SlackAdapter(BasePlatformAdapter):
 
         try:
             cmd_preview = command[:2900] + "..." if len(command) > 2900 else command
+            reason = description.strip() if description and description.strip().lower() != "dangerous command" else "this action changes something outside the chat"
             thread_ts = self._resolve_thread_ts(None, metadata)
 
             blocks = [
@@ -2701,9 +2719,10 @@ class SlackAdapter(BasePlatformAdapter):
                     "text": {
                         "type": "mrkdwn",
                         "text": (
-                            f":warning: *Command Approval Required*\n"
+                            f"*Approval needed before I continue*\n"
+                            f"I’m about to take an action outside this chat, so I need an explicit yes first.\n"
                             f"```{cmd_preview}```\n"
-                            f"Reason: {description}"
+                            f"Reason: {reason}"
                         ),
                     },
                 },
@@ -2742,7 +2761,7 @@ class SlackAdapter(BasePlatformAdapter):
 
             kwargs: Dict[str, Any] = {
                 "channel": chat_id,
-                "text": f"⚠️ Command approval required: {cmd_preview[:100]}",
+                "text": f"Approval needed before continuing: {cmd_preview[:100]}",
                 "blocks": blocks,
             }
             if thread_ts:

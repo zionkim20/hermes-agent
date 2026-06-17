@@ -92,6 +92,7 @@ def test_create_task_appears_on_board(client):
             "assignee": "researcher",
             "priority": 3,
             "tenant": "acme",
+            "kind": "household",
         },
     )
     assert r.status_code == 200, r.text
@@ -101,6 +102,7 @@ def test_create_task_appears_on_board(client):
     assert task["status"] == "ready"  # no parents -> immediately ready
     assert task["priority"] == 3
     assert task["tenant"] == "acme"
+    assert task["kind"] == "household"
     task_id = task["id"]
 
     # Board now lists it under 'ready'.
@@ -110,6 +112,7 @@ def test_create_task_appears_on_board(client):
     ready = next(c for c in data["columns"] if c["name"] == "ready")
     assert len(ready["tasks"]) == 1
     assert ready["tasks"][0]["id"] == task_id
+    assert ready["tasks"][0]["kind"] == "household"
     assert "acme" in data["tenants"]
     assert "researcher" in data["assignees"]
 

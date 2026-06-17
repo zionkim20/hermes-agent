@@ -27,6 +27,7 @@ from typing import Any, Callable, Optional
 from gateway.platforms.base import BasePlatformAdapter as _BasePlatformAdapter
 from gateway.platforms.base import _custom_unit_to_cp
 from gateway.platforms.base import MEDIA_TAG_CLEANUP_RE
+from gateway.platforms.base import is_silent_response, looks_like_internal_planning_leak
 from gateway.config import (
     DEFAULT_STREAMING_EDIT_INTERVAL as _DEFAULT_STREAMING_EDIT_INTERVAL,
     DEFAULT_STREAMING_BUFFER_THRESHOLD as _DEFAULT_STREAMING_BUFFER_THRESHOLD,
@@ -456,6 +457,12 @@ class GatewayStreamConsumer:
                 # tag is not lost.
                 if got_done:
                     self._flush_think_buffer()
+                    if is_silent_response(self._accumulated) and self._message_id is None:
+                        logger.info("Stream consumer received [SILENT]; suppressing delivery to %s", self.chat_id)
+                        self._accumulated = ""
+                        self._last_sent_text = ""
+                        self._final_response_sent = True
+                        return
 
                 # Decide whether to flush an edit
                 now = time.monotonic()
@@ -700,6 +707,8 @@ class GatewayStreamConsumer:
 
         Returns the message_id so callers can thread subsequent chunks.
         """
+        if await self._suppress_if_internal_planning(text):
+            return reply_to_id
         text = self._clean_for_display(text)
         if not text.strip():
             return reply_to_id
@@ -766,6 +775,11 @@ class GatewayStreamConsumer:
 
         Retries each chunk once on flood-control failures with a short delay.
         """
+        if await self._suppress_if_internal_planning(text):
+            self._already_sent = True
+            self._final_response_sent = True
+            self._fallback_final_send = False
+            return
         final_text = self._clean_for_display(text)
         continuation = self._continuation_text(final_text)
         self._fallback_final_send = False
@@ -1138,6 +1152,30 @@ class GatewayStreamConsumer:
             self._final_response_sent = True
         return True
 
+    async def _suppress_if_internal_planning(self, text: str) -> bool:
+        if not looks_like_internal_planning_leak(text):
+            return False
+        logger.warning(
+            "Suppressing internal planning-looking stream text for chat=%s",
+            self.chat_id,
+        )
+        old_message_id = self._message_id
+        if old_message_id and old_message_id != "__no_edit__":
+            delete_fn = getattr(self.adapter, "delete_message", None)
+            if delete_fn is not None:
+                try:
+                    await delete_fn(self.chat_id, old_message_id)
+                except Exception as e:
+                    logger.debug(
+                        "Internal-planning preview cleanup failed (%s): %s",
+                        old_message_id, e,
+                    )
+        self._message_id = None
+        self._message_created_ts = None
+        self._last_sent_text = ""
+        self._fallback_prefix = ""
+        return True
+
     async def _send_or_edit(
         self, text: str, *, finalize: bool = False, is_turn_final: bool = True,
     ) -> bool:
@@ -1150,6 +1188,10 @@ class GatewayStreamConsumer:
         ``finalize`` is True when this is the last edit in a streaming
         sequence.
         """
+        if await self._suppress_if_internal_planning(text):
+            self._accumulated = ""
+            return True
+
         # Strip MEDIA: directives so they don't appear as visible text.
         # Media files are delivered as native attachments after the stream
         # finishes (via _deliver_media_from_response in gateway/run.py).

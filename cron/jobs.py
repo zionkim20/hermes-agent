@@ -523,6 +523,41 @@ def _normalize_workdir(workdir: Optional[str]) -> Optional[str]:
     return str(resolved)
 
 
+def _validate_script_field(script: Optional[str]) -> None:
+    """Reject the args-in-script footgun at create/update time.
+
+    The scheduler treats the entire ``script`` field as a single file path —
+    ``_run_job_script`` builds ``argv = [interpreter, path]`` and parses NO
+    arguments (cron/scheduler.py). So a value like ``"mia_signal_loop.py --apply"``
+    resolves a literal filename containing a space and fails ``Script not found``
+    at run time, silently, every night. This was the root cause of HUM-1493/1495.
+
+    Catch it loudly at create/update time instead: a ``script`` carrying internal
+    whitespace or flag-like tokens cannot be a real path and is almost certainly an
+    attempt to pass CLI args inline. The fix is a no-arg wrapper script (a ``.sh``
+    that ``exec``s the real script with its flags) with ``script`` pointed at the
+    wrapper.
+    """
+    if not isinstance(script, str):
+        return
+    stripped = script.strip()
+    if not stripped:
+        return
+    tokens = stripped.split()
+    has_flag = any(tok.startswith("-") for tok in tokens)
+    if len(tokens) > 1 or has_flag:
+        raise ValueError(
+            f"Invalid cron 'script' field {script!r}: the script field is a single "
+            f"file path and cannot carry CLI arguments or flags. The runner executes "
+            f"it as [python|bash, <path>] with no argument parsing, so a value with "
+            f"whitespace or flag tokens resolves to a literal filename (e.g. a file "
+            f"named 'foo.py --apply') and fails 'Script not found' at run time. "
+            f"Put the flags inside a no-arg wrapper script — a .sh that execs the real "
+            f"script with its flags — and point 'script' at the wrapper. "
+            f"See the mia_signal_loop_apply.sh pattern (HUM-1498)."
+        )
+
+
 def _normalize_profile(profile: Optional[str]) -> Optional[str]:
     """Normalize and validate an optional cron job profile name.
 
@@ -642,6 +677,7 @@ def create_job(
     normalized_model = normalized_model or None
     normalized_provider = normalized_provider or None
     normalized_base_url = normalized_base_url or None
+    _validate_script_field(script)
     normalized_script = str(script).strip() if isinstance(script, str) else None
     normalized_script = normalized_script or None
     normalized_toolsets = [str(t).strip() for t in enabled_toolsets if str(t).strip()] if enabled_toolsets else None
@@ -791,6 +827,10 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 updates["workdir"] = None
             else:
                 updates["workdir"] = _normalize_workdir(_wd)
+
+        # Reject the args-in-script footgun on update too (same rule as create).
+        if "script" in updates:
+            _validate_script_field(updates["script"])
 
         # Validate / normalize profile if present in updates.  Empty string or
         # None both mean "clear the field" (restore old behaviour).

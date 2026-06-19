@@ -1020,7 +1020,21 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         )
 
     if not path.exists():
-        return False, f"Script not found: {path}"
+        msg = f"Script not found: {path}"
+        # Common footgun: the cron `script` field is a single path with NO arg
+        # parsing (argv = [interpreter, path]). A value like "foo.py --apply"
+        # resolves a literal filename containing a space/flags and lands here.
+        # Hint at the wrapper-script fix so this is self-diagnosing (HUM-1498).
+        raw_str = str(script_path)
+        if raw_str.split() != [raw_str]:
+            msg += (
+                f"\nHint: the script field {raw_str!r} contains whitespace/flag tokens. "
+                "The cron runner treats the whole field as ONE file path and parses no "
+                "CLI args, so flags belong inside a no-arg wrapper script (a .sh that "
+                "execs the real script with its flags), with 'script' pointed at the "
+                "wrapper."
+            )
+        return False, msg
     if not path.is_file():
         return False, f"Script path is not a file: {path}"
 

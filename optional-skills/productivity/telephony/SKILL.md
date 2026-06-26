@@ -409,6 +409,69 @@ After setup, you should be able to do all of the following with just this skill:
 6. place a direct Twilio call
 7. place an AI call via Bland or Vapi
 
+## Call-before-routing (governed travel/vendor verification)
+
+`scripts/call_before_routing.py` is a **governed policy layer on top of** the
+`ai-call` / `ai-status` primitives above. It is the V1 path for HUM-1848: verify
+a restaurant / vendor / travel stop by phone *before* routing a household to it
+when the cost of a wrong stop is high. It is **not** general phone autonomy.
+
+It does not place calls itself — it decides whether a call is required, scripts
+it (data-minimized), turns the raw `ai-status` payload into a structured result,
+and gates the household-facing recommendation.
+
+### When a verification call is required
+
+`requires_verification(ctx)` returns true when any of these hold:
+- **European restaurant in June/July/August** — summer-vacation closures are
+  common and Google Maps / online open-state is unreliable. In this window,
+  Maps "open" is **never** sufficient; require live phone / direct site / social
+  / door confirmation before routing.
+- online availability data is contradictory
+- the stop is holiday/vacation-prone or mission-critical
+- travelling with a child or under tight timing (a wasted stop is high cost)
+
+### Approval & data-minimization policy
+
+1. Ask the household for approval before placing a call **unless** a pre-approved
+   narrow call-before-routing rule is already in effect for this trip.
+2. The generated script and any stored note must **never** disclose the child's
+   name, exact accommodation, personal schedule, or internal HUM/Mia context.
+   Pass anything that must be scrubbed in `CallContext.sensitive_terms`.
+3. Persist the structured `CallResult` (metadata + outcome) for the trip/session,
+   not full sensitive household details.
+4. Every mutating Paperclip API write related to this stays on Authorization
+   bearer auth + `X-Paperclip-Run-Id` — never browser/local-board sessions.
+
+### Confidence gating (the safety core)
+
+`derive_confidence(...)` / `derive_recommendation(...)` enforce:
+- only a **live human** answer can produce a route-able `verified` result
+- a live human result that contradicts online data is `contradicted` and the
+  **verified phone result overrides stale Maps**
+- voicemail / recording / no-answer / failed, or human-but-uncertain, is
+  `unverified` — a failed / no-answer call is **never** a confident recommendation
+
+### Household-facing language
+
+`household_message(...)` returns plain, non-technical text, e.g.
+"I called Chez Marcel and they confirmed they're open and serving now." or
+"I couldn't reach them, so I won't treat it as verified — I'll suggest a place I
+can confirm instead."
+
+### Wiring to the primitive
+
+1. `build_call_script(ctx)` → pass as the `task` to `ai-call`.
+2. Poll `ai-status` (with `--analyze` questions) until completed.
+3. Interpret the transcript/analysis into `open_status` /
+   `kitchen_or_service_available`, then call `build_call_result(...)`.
+4. Use `derive_recommendation(result, ctx)` to decide routing + the message.
+
+QA: `scripts/test_call_before_routing.py` covers stale-map override, Europe
+summer closure, no-answer fallback, the never-confident-on-failure invariant,
+structured-result completeness, and data-minimization
+(`venv/bin/python -m pytest .../test_call_before_routing.py -o addopts="" -q`).
+
 ## References
 
 - Twilio phone numbers: https://www.twilio.com/docs/phone-numbers/api

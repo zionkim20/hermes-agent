@@ -1083,6 +1083,39 @@ class TestBuildSystemPrompt:
         prompt = agent._build_system_prompt()
         assert MEMORY_GUIDANCE not in prompt
 
+    def test_email_link_preflight_injected_when_web_search_loaded(self, agent):
+        """HUM-1985: the email/thread link preflight must be present whenever
+        public web_search is available (the path it gates)."""
+        from agent.prompt_builder import EMAIL_LINK_PREFLIGHT_GUIDANCE
+
+        # The default `agent` fixture loads web_search.
+        prompt = agent._build_system_prompt()
+        assert EMAIL_LINK_PREFLIGHT_GUIDANCE in prompt
+
+    def test_email_link_preflight_absent_without_web_search(self):
+        """No web_search tool means no public-search path to preflight, so the
+        guidance is not injected."""
+        from agent.prompt_builder import EMAIL_LINK_PREFLIGHT_GUIDANCE
+
+        with (
+            patch(
+                "run_agent.get_tool_definitions",
+                return_value=_make_tool_defs("terminal"),
+            ),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            a = AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            a.client = MagicMock()
+            prompt = a._build_system_prompt()
+        assert EMAIL_LINK_PREFLIGHT_GUIDANCE not in prompt
+
     def test_includes_datetime(self, agent):
         prompt = agent._build_system_prompt()
         # Should contain current date info like "Conversation started:"

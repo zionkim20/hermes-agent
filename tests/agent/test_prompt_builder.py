@@ -23,6 +23,7 @@ from agent.prompt_builder import (
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
+    EMAIL_LINK_PREFLIGHT_GUIDANCE,
     MEMORY_GUIDANCE,
     SESSION_SEARCH_GUIDANCE,
     PLATFORM_HINTS,
@@ -47,6 +48,45 @@ class TestGuidanceConstants:
     def test_session_search_guidance_is_simple_cross_session_recall(self):
         assert "relevant cross-session context exists" in SESSION_SEARCH_GUIDANCE
         assert "recent turns of the current session" not in SESSION_SEARCH_GUIDANCE
+
+    def test_email_link_preflight_requires_mail_before_web_search(self):
+        g = EMAIL_LINK_PREFLIGHT_GUIDANCE
+        # Mail is the source of truth and must be searched before web_search.
+        assert "source of truth" in g
+        assert "BEFORE you run a public web_search" in g
+        # Trigger phrases from the spec are present.
+        for phrase in ("in the email", "in the thread", "reservation link", "booking link"):
+            assert phrase in g
+        # Candidate-link extraction context.
+        for ctx in ("sender", "subject", "date", "domain"):
+            assert ctx in g
+        # One concise disambiguation instead of guessing.
+        assert "ONE concise plain-English clarification" in g
+        assert "instead of guessing" in g
+        # Web search is only a fallback after mail returns nothing usable.
+        assert "fall back to public web_search" in g
+        assert "no usable link" in g
+
+    def test_email_link_preflight_does_not_leak_secrets_in_audit(self):
+        g = EMAIL_LINK_PREFLIGHT_GUIDANCE
+        # Audit retains only minimal sanitized metadata, never secrets/contents.
+        assert "minimal sanitized metadata" in g
+        assert "never log secrets" in g
+        assert "full email contents" in g
+
+    def test_email_link_preflight_chateau_la_dominique_regression(self):
+        """Regression fixture for the Château La Dominique pattern (HUM-1985):
+        a user says a reservation link is in an email thread; the guidance must
+        make the first retrieval step a mail search, not a public web search,
+        and must forbid following a vendor path before checking mail."""
+        g = EMAIL_LINK_PREFLIGHT_GUIDANCE
+        # The booking/reservation-in-email scenario routes to mail first.
+        assert "reservation link" in g
+        mail_idx = g.index("search the household-authorized mailbox")
+        web_idx = g.index("web_search")
+        assert mail_idx < web_idx, "mail retrieval must be instructed before web_search"
+        # Must not route to a vendor booking path when an email link is likely.
+        assert "Do not route to a public/vendor booking path" in g
 
 
 # =========================================================================

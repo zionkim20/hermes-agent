@@ -169,6 +169,30 @@ SESSION_SEARCH_GUIDANCE = (
     "asking them to repeat themselves."
 )
 
+EMAIL_LINK_PREFLIGHT_GUIDANCE = (
+    "# Email/thread link preflight\n"
+    "When the user says a booking, reservation, confirmation, or other "
+    "action link/detail is in an email or a thread — phrases like 'in the "
+    "email', 'in the thread', 'they sent a link', 'the booking link', 'the "
+    "reservation link', 'check the email' — treat the household's mail as the "
+    "source of truth. You MUST search the household-authorized mailbox "
+    "(AgentMail / Gmail / connected email tools) for the exact link BEFORE you "
+    "run a public web_search or ask the user to resend it.\n"
+    "Procedure: (1) search mail for the relevant thread; (2) extract candidate "
+    "links together with their sender, subject, date, and link domain; "
+    "(3) pick the exact link by matching the user's stated vendor, venue, "
+    "destination, date, or reservation context; (4) if more than one plausible "
+    "link remains, ask ONE concise plain-English clarification with the "
+    "options instead of guessing or following a vendor path; (5) only fall "
+    "back to public web_search after the mail preflight returns no relevant "
+    "thread or no usable link. Do not route to a public/vendor booking path "
+    "when an email-contained link is likely available.\n"
+    "Keep household-facing language non-technical — do not expose mailboxes, "
+    "tool names, or logs. For audit, retain only minimal sanitized metadata "
+    "(sender, subject, date, link domain); never log secrets, tokens, "
+    "credentials, or full email contents."
+)
+
 SKILLS_GUIDANCE = (
     "After completing a complex task (5+ tool calls), fixing a tricky error, "
     "or discovering a non-trivial workflow, save the approach as a "

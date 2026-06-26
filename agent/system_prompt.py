@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Optional
 
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY,
+    EMAIL_LINK_PREFLIGHT_GUIDANCE,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
     KANBAN_GUIDANCE,
@@ -119,6 +120,13 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         tool_guidance.append(SESSION_SEARCH_GUIDANCE)
     if "skill_manage" in agent.valid_tool_names:
         tool_guidance.append(SKILLS_GUIDANCE)
+    # Email/thread link preflight: when public web search is available, tell
+    # the agent to retrieve a user-referenced email/booking link from the
+    # household mailbox before falling back to web_search or asking for a
+    # resend. Gated on web_search because that's the path we're preflighting
+    # against (HUM-1985).
+    if "web_search" in agent.valid_tool_names:
+        tool_guidance.append(EMAIL_LINK_PREFLIGHT_GUIDANCE)
     # Kanban worker/orchestrator lifecycle — only present when the
     # dispatcher spawned this process (kanban_show check_fn gates on
     # HERMES_KANBAN_TASK env var). Normal chat sessions never see

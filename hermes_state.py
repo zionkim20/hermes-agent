@@ -294,6 +294,28 @@ CREATE TABLE IF NOT EXISTS state_meta (
     value TEXT
 );
 
+-- Durable queue for inter-agent (agent→agent) handoffs. Unlike the
+-- ``sessions``-row handoff (which re-binds a CLI session to a platform home
+-- channel), an inter-agent handoff carries a message addressed to a
+-- destination agent that must be delivered as an actionable incoming turn,
+-- independent of any chat transport (e.g. Telegram drops bot→bot messages).
+-- The gateway watcher polls ``state='pending'`` rows and injects each one as
+-- a synthetic actionable turn into the destination platform's home channel.
+CREATE TABLE IF NOT EXISTS inter_agent_handoffs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    target_platform TEXT NOT NULL,
+    target_agent TEXT,
+    origin_agent TEXT,
+    text TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'pending',
+    error TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_inter_agent_handoffs_pending
+    ON inter_agent_handoffs(state, created_at);
+
 CREATE TABLE IF NOT EXISTS compression_locks (
     session_id TEXT PRIMARY KEY,
     holder TEXT NOT NULL,
@@ -4362,5 +4384,100 @@ class SessionDB:
                 "UPDATE sessions SET handoff_state = 'failed', "
                 "handoff_error = ? WHERE id = ?",
                 (error[:500], session_id),
+            )
+        self._execute_write(_do)
+
+    # ── Inter-agent handoff (agent→agent durable injection) ────────────────
+    #
+    # A separate durable queue from the ``sessions``-row handoff above. Used
+    # when one agent must hand a message to another agent (e.g. Ari → Mia) as
+    # an actionable incoming turn, independent of any chat transport. Telegram
+    # drops bot→bot messages outright, so a shared chat is not a reliable
+    # delivery path between two bots; this queue is.
+    #
+    # State machine mirrors the session handoff:
+    #   "pending"  → enqueued, gateway hasn't picked it up
+    #   "running"  → gateway is injecting the synthetic actionable turn
+    #   "completed"→ delivered
+    #   "failed"   → error recorded in ``error``
+
+    def enqueue_inter_agent_handoff(
+        self,
+        target_platform: str,
+        text: str,
+        *,
+        target_agent: Optional[str] = None,
+        origin_agent: Optional[str] = None,
+    ) -> int:
+        """Enqueue an inter-agent handoff. Returns the new row id.
+
+        ``target_platform`` is the platform whose home channel the destination
+        agent ingests (e.g. ``"telegram"``). ``text`` is the message addressed
+        to the destination agent, delivered verbatim as an actionable turn.
+        """
+        now = time.time()
+
+        def _do(conn):
+            cur = conn.execute(
+                "INSERT INTO inter_agent_handoffs "
+                "(target_platform, target_agent, origin_agent, text, "
+                " state, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, 'pending', ?, ?)",
+                (
+                    str(target_platform).strip().lower(),
+                    target_agent,
+                    origin_agent,
+                    text,
+                    now,
+                    now,
+                ),
+            )
+            return int(cur.lastrowid)
+
+        return self._execute_write(_do)
+
+    def list_pending_inter_agent_handoffs(self) -> List[Dict[str, Any]]:
+        """Return all inter-agent handoffs in state='pending', oldest first."""
+        try:
+            cur = self._conn.execute(
+                "SELECT * FROM inter_agent_handoffs "
+                "WHERE state = 'pending' "
+                "ORDER BY created_at ASC, id ASC"
+            )
+            return [dict(r) for r in cur.fetchall()]
+        except Exception:
+            return []
+
+    def claim_inter_agent_handoff(self, handoff_id: int) -> bool:
+        """Atomically transition pending → running. Returns True if claimed."""
+        def _do(conn):
+            cur = conn.execute(
+                "UPDATE inter_agent_handoffs "
+                "SET state = 'running', updated_at = ? "
+                "WHERE id = ? AND state = 'pending'",
+                (time.time(), handoff_id),
+            )
+            return cur.rowcount > 0
+        return self._execute_write(_do)
+
+    def complete_inter_agent_handoff(self, handoff_id: int) -> None:
+        """Mark an inter-agent handoff as completed."""
+        def _do(conn):
+            conn.execute(
+                "UPDATE inter_agent_handoffs "
+                "SET state = 'completed', error = NULL, updated_at = ? "
+                "WHERE id = ?",
+                (time.time(), handoff_id),
+            )
+        self._execute_write(_do)
+
+    def fail_inter_agent_handoff(self, handoff_id: int, error: str) -> None:
+        """Mark an inter-agent handoff as failed and record the reason."""
+        def _do(conn):
+            conn.execute(
+                "UPDATE inter_agent_handoffs "
+                "SET state = 'failed', error = ?, updated_at = ? "
+                "WHERE id = ?",
+                (error[:500], time.time(), handoff_id),
             )
         self._execute_write(_do)

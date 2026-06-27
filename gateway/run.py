@@ -5204,6 +5204,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             session_id, exc, exc_info=True,
                         )
                         self._session_db.fail_handoff(session_id, str(exc))
+
+                # Inter-agent (agent→agent) handoffs: a separate durable queue
+                # that injects an addressed-to-agent message as an actionable
+                # turn, independent of any chat transport (Telegram drops
+                # bot→bot messages, so a shared chat can't carry these).
+                inter = self._session_db.list_pending_inter_agent_handoffs()
+                for hrow in inter:
+                    handoff_id = hrow.get("id")
+                    if handoff_id is None:
+                        continue
+                    if not self._session_db.claim_inter_agent_handoff(handoff_id):
+                        # Another tick/gateway already claimed it.
+                        continue
+                    try:
+                        await self._process_inter_agent_handoff(hrow)
+                        self._session_db.complete_inter_agent_handoff(handoff_id)
+                    except Exception as exc:
+                        logger.warning(
+                            "Inter-agent handoff %s failed: %s",
+                            handoff_id, exc, exc_info=True,
+                        )
+                        self._session_db.fail_inter_agent_handoff(
+                            handoff_id, str(exc)
+                        )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -5365,6 +5389,130 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         send_metadata: Dict[str, Any] = {}
         if effective_thread_id:
             send_metadata["thread_id"] = effective_thread_id
+        try:
+            result = await adapter.send(
+                chat_id=str(home.chat_id),
+                content=response_text,
+                metadata=send_metadata or None,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"adapter.send failed: {exc}") from exc
+
+        if not getattr(result, "success", True):
+            err = getattr(result, "error", "send returned success=False")
+            raise RuntimeError(f"adapter.send failed: {err}")
+
+    async def _process_inter_agent_handoff(self, row: Dict[str, Any]) -> None:
+        """Inject one inter-agent handoff as an actionable incoming turn.
+
+        Unlike ``_process_handoff`` (which re-binds a CLI session to a home
+        channel), this carries a message *addressed to a destination agent*
+        and delivers it as a synthetic **actionable** turn into that agent's
+        home-channel session — independent of any chat transport. This is the
+        durable path that survives Telegram's bot→bot drop: the message never
+        needs to traverse a shared chat between two bots.
+
+        Raises on failure (caller marks the row failed).
+        """
+        from gateway.config import Platform
+        from gateway.session import SessionSource
+        from gateway.platforms.base import MessageEvent
+
+        handoff_id = row.get("id")
+        platform_name = (row.get("target_platform") or "").strip().lower()
+        if not platform_name:
+            raise RuntimeError("target_platform is empty")
+
+        text = row.get("text") or ""
+        if not text.strip():
+            raise RuntimeError("inter-agent handoff text is empty")
+
+        target_agent = row.get("target_agent")
+        origin_agent = row.get("origin_agent")
+
+        # Resolve platform enum.
+        try:
+            platform = Platform(platform_name)
+        except (ValueError, KeyError):
+            raise RuntimeError(f"unknown platform '{platform_name}'")
+
+        # Adapter must be live.
+        adapter = self.adapters.get(platform)
+        if not adapter:
+            raise RuntimeError(
+                f"platform '{platform_name}' is not active in this gateway"
+            )
+
+        # Home channel must be configured — that's the destination agent's
+        # ingestion surface.
+        home = self.config.get_home_channel(platform)
+        if not home or not home.chat_id:
+            raise RuntimeError(
+                f"no home channel configured for {platform_name}; "
+                f"run /sethome on the destination agent's chat first"
+            )
+
+        # The home channel may itself carry a thread_id; honor it so the turn
+        # lands where the agent is actually listening.
+        thread_id = str(home.thread_id) if home.thread_id else None
+        dest_chat_type = "thread" if thread_id else "dm"
+
+        # Synthetic turn keyed as a system handoff. user_id="system:handoff"
+        # mirrors the CLI→gateway path (run.py _process_handoff) so the turn
+        # bypasses user-authorization gating and is never observe-only.
+        dest_source = SessionSource(
+            platform=platform,
+            chat_id=str(home.chat_id),
+            chat_name=home.name,
+            chat_type=dest_chat_type,
+            user_id="system:handoff",
+            user_name=origin_agent or "Handoff",
+            thread_id=thread_id,
+        )
+
+        # Ensure a session exists for the destination so the synthetic turn
+        # has somewhere to land. We do NOT switch_session here — an
+        # inter-agent handoff adds a turn to the destination agent's ongoing
+        # session rather than replacing it.
+        self.session_store.get_or_create_session(dest_source)
+
+        # Frame the body so the destination agent sees an addressed,
+        # actionable inbound message rather than ambient chatter.
+        if origin_agent and target_agent:
+            framed = (
+                f"[Inter-agent handoff from {origin_agent} to {target_agent}]\n"
+                f"{text}"
+            )
+        elif origin_agent:
+            framed = f"[Inter-agent handoff from {origin_agent}]\n{text}"
+        else:
+            framed = f"[Inter-agent handoff]\n{text}"
+
+        synthetic_event = MessageEvent(
+            text=framed,
+            source=dest_source,
+            internal=True,
+        )
+
+        # Ingestion log line (required acceptance: prove ingestion happened).
+        logger.info(
+            "Inter-agent handoff %s: injecting actionable turn "
+            "(origin=%s, target=%s, platform=%s, chat=%s, thread=%s)",
+            handoff_id, origin_agent, target_agent, platform_name,
+            home.chat_id, thread_id,
+        )
+
+        # Dispatch inline through the runner so the agent actually runs on the
+        # injected turn and success/failure stays observable for the watcher.
+        response_text = await self._handle_message(synthetic_event)
+        if not response_text:
+            # Streaming may have delivered the reply inline; agent ran without
+            # raising — count as success.
+            return
+
+        send_metadata: Dict[str, Any] = {}
+        if thread_id:
+            send_metadata["thread_id"] = thread_id
         try:
             result = await adapter.send(
                 chat_id=str(home.chat_id),

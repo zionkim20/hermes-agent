@@ -8151,7 +8151,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Build the context prompt to inject
         context_prompt = build_session_context_prompt(context, redact_pii=_redact_pii)
-        
+
+        # ── Active booking-task continuity preflight (HUM-2199 / HUM-1918) ──
+        # If this household has an in-flight external-vendor booking task and
+        # the inbound message references it ("that winery tour", "the
+        # reservation", or a continue/book/confirm intent), anchor those facts
+        # into the agent context BEFORE it decides to run a fresh lookup. Fully
+        # guarded — a failure here must never break message handling.
+        try:
+            if self._session_db is not None and source is not None:
+                from gateway.booking_continuity import (
+                    detect_continuity_signal,
+                    build_preflight_note,
+                )
+                _platform = source.platform.value if source.platform else ""
+                _household_id = f"{_platform}:{getattr(source, 'chat_id', '') or ''}"
+                _thread = str(
+                    getattr(source, "thread_id", None)
+                    or getattr(source, "chat_id", "")
+                    or ""
+                )
+                if detect_continuity_signal(event.text or ""):
+                    _booking_task = self._session_db.get_active_booking_task(
+                        _household_id, _thread
+                    )
+                    if _booking_task:
+                        _note = build_preflight_note(_booking_task)
+                        context_prompt = _note + "\n\n" + context_prompt
+                        logger.info(
+                            "Booking-continuity preflight: anchored task %s "
+                            "(%s) injected for %s/%s",
+                            _booking_task.get("id"),
+                            _booking_task.get("vendor_entity"),
+                            _household_id,
+                            _thread,
+                        )
+        except Exception as _bc_exc:
+            logger.debug("booking-continuity preflight skipped: %s", _bc_exc)
+
         # If the previous session expired and was auto-reset, prepend a notice
         # so the agent knows this is a fresh conversation (not an intentional /reset).
         if getattr(session_entry, 'was_auto_reset', False):

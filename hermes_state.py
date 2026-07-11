@@ -316,6 +316,41 @@ CREATE TABLE IF NOT EXISTS inter_agent_handoffs (
 CREATE INDEX IF NOT EXISTS idx_inter_agent_handoffs_pending
     ON inter_agent_handoffs(state, created_at);
 
+-- Active external-vendor booking task per household/deployment + source
+-- thread. When Mia receives booking-relevant vendor evidence (a voice note,
+-- screenshot, vendor reply, or link) she anchors a structured task object
+-- here. Later deictic references ("that winery tour", "the reservation")
+-- resolve against this record BEFORE any fresh web/search lookup, and a
+-- conflicting lookup result must not silently overwrite the anchored facts.
+-- Only one active (``superseded=0``) task per (household, thread); an
+-- explicit user switch supersedes the prior task rather than mutating it.
+CREATE TABLE IF NOT EXISTS active_booking_task (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    household_id TEXT NOT NULL,
+    source_channel_thread TEXT NOT NULL,
+    requester TEXT,
+    task_type TEXT,
+    vendor_entity TEXT,
+    offering_name TEXT,
+    date TEXT,
+    time_window TEXT,
+    party_size TEXT,
+    source_evidence_type TEXT,
+    source_evidence_summary TEXT,
+    reservation_url_or_contact TEXT,
+    booking_status TEXT NOT NULL DEFAULT 'unknown',
+    last_confirmed_at REAL,
+    confidence TEXT,
+    ambiguity_notes TEXT,
+    superseded INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL,
+    updated_at REAL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_active_booking_task_active
+    ON active_booking_task(household_id, source_channel_thread)
+    WHERE superseded = 0;
+
 CREATE TABLE IF NOT EXISTS compression_locks (
     session_id TEXT PRIMARY KEY,
     holder TEXT NOT NULL,
@@ -4479,5 +4514,144 @@ class SessionDB:
                 "SET state = 'failed', error = ?, updated_at = ? "
                 "WHERE id = ?",
                 (error[:500], time.time(), handoff_id),
+            )
+        self._execute_write(_do)
+
+    # ── Active booking-task continuity (HUM-2199 / HUM-1918) ────────────
+    # A structured record of an in-flight external-vendor booking task, so
+    # that later deictic references ("that winery tour") resolve against the
+    # anchored facts BEFORE any fresh web/search lookup, and a conflicting
+    # lookup cannot silently overwrite anchored vendor/date/offering facts.
+
+    # Columns an upsert is allowed to enrich (everything except the natural
+    # key, bookkeeping, and the id).
+    _BOOKING_TASK_FIELDS = (
+        "requester",
+        "task_type",
+        "vendor_entity",
+        "offering_name",
+        "date",
+        "time_window",
+        "party_size",
+        "source_evidence_type",
+        "source_evidence_summary",
+        "reservation_url_or_contact",
+        "booking_status",
+        "confidence",
+        "ambiguity_notes",
+    )
+
+    def upsert_active_booking_task(
+        self,
+        household_id: str,
+        source_channel_thread: str,
+        **fields: Any,
+    ) -> int:
+        """Create or enrich the active booking task for (household, thread).
+
+        Only one active (``superseded=0``) task exists per key. If one is
+        present it is *enriched*: non-null provided fields overwrite, but a
+        ``None``/omitted field never blanks an existing value (new evidence
+        adds, it does not erase). Returns the task row id.
+
+        This is the persistence half of the continuity guard — the conflict
+        check between anchored facts and a fresh lookup lives in the resolver
+        (``gateway.booking_continuity``); this method only records what the
+        agent has explicitly decided to anchor.
+        """
+        household_id = str(household_id)
+        source_channel_thread = str(source_channel_thread)
+        now = time.time()
+        # Drop unknown kwargs defensively so a caller typo can't inject SQL
+        # column names — only whitelisted fields are writable.
+        clean = {k: v for k, v in fields.items()
+                 if k in self._BOOKING_TASK_FIELDS and v is not None}
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT id FROM active_booking_task "
+                "WHERE household_id = ? AND source_channel_thread = ? "
+                "AND superseded = 0",
+                (household_id, source_channel_thread),
+            ).fetchone()
+            if row is not None:
+                task_id = int(row["id"] if isinstance(row, sqlite3.Row) else row[0])
+                if clean:
+                    assignments = ", ".join(f"{k} = ?" for k in clean)
+                    params = list(clean.values()) + [now, task_id]
+                    conn.execute(
+                        f"UPDATE active_booking_task SET {assignments}, "
+                        "updated_at = ? WHERE id = ?",
+                        params,
+                    )
+                return task_id
+            cols = ["household_id", "source_channel_thread"] + list(clean.keys())
+            placeholders = ", ".join(["?"] * len(cols))
+            params = [household_id, source_channel_thread] + list(clean.values())
+            cur = conn.execute(
+                f"INSERT INTO active_booking_task "
+                f"({', '.join(cols)}, created_at, updated_at) "
+                f"VALUES ({placeholders}, ?, ?)",
+                params + [now, now],
+            )
+            return int(cur.lastrowid)
+
+        return self._execute_write(_do)
+
+    def get_active_booking_task(
+        self, household_id: str, source_channel_thread: str
+    ) -> Optional[Dict[str, Any]]:
+        """Return the active (non-superseded) booking task for a key, or None."""
+        try:
+            cur = self._conn.execute(
+                "SELECT * FROM active_booking_task "
+                "WHERE household_id = ? AND source_channel_thread = ? "
+                "AND superseded = 0 "
+                "ORDER BY updated_at DESC, id DESC LIMIT 1",
+                (str(household_id), str(source_channel_thread)),
+            )
+            row = cur.fetchone()
+            return dict(row) if row is not None else None
+        except Exception:
+            return None
+
+    def update_booking_status(
+        self,
+        task_id: int,
+        booking_status: str,
+        *,
+        mark_confirmed: bool = False,
+    ) -> None:
+        """Update a task's booking_status; optionally stamp last_confirmed_at."""
+        def _do(conn):
+            now = time.time()
+            if mark_confirmed:
+                conn.execute(
+                    "UPDATE active_booking_task SET booking_status = ?, "
+                    "last_confirmed_at = ?, updated_at = ? WHERE id = ?",
+                    (booking_status, now, now, task_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE active_booking_task SET booking_status = ?, "
+                    "updated_at = ? WHERE id = ?",
+                    (booking_status, now, task_id),
+                )
+        self._execute_write(_do)
+
+    def supersede_active_booking_task(
+        self, household_id: str, source_channel_thread: str
+    ) -> None:
+        """Retire the active task for a key (used on an explicit user switch).
+
+        Marks it ``superseded=1`` so it stays in the audit trail but no longer
+        anchors resolution; the next upsert on the same key starts fresh.
+        """
+        def _do(conn):
+            conn.execute(
+                "UPDATE active_booking_task SET superseded = 1, updated_at = ? "
+                "WHERE household_id = ? AND source_channel_thread = ? "
+                "AND superseded = 0",
+                (time.time(), str(household_id), str(source_channel_thread)),
             )
         self._execute_write(_do)

@@ -114,6 +114,115 @@ def detect_explicit_switch(text: Optional[str]) -> Optional[str]:
     return vendor or None
 
 
+# ── Inbound evidence extraction (write half of the continuity guard) ─────────
+# Deliberately conservative: we only ever *anchor* (create/enrich) a booking
+# task from a message that carries a high-signal fact — a named venue entity or
+# a reservation link. A bare date or the word "tour" is not enough. False
+# negatives (missing an anchor) are safe; a false positive that anchors noise is
+# not, so the bar to write is intentionally high and the write is conflict-
+# guarded downstream (``detect_conflict`` + enrich-not-blank upsert).
+
+_MONTHS = (
+    "January|February|March|April|May|June|July|August|September|October|"
+    "November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sept?|Oct|Nov|Dec"
+)
+_DATE_DAY_MONTH = re.compile(
+    rf"\b(\d{{1,2}}(?:st|nd|rd|th)?\s+(?:{_MONTHS}))\b", re.IGNORECASE
+)
+_DATE_MONTH_DAY = re.compile(
+    rf"\b((?:{_MONTHS})\s+\d{{1,2}}(?:st|nd|rd|th)?)\b", re.IGNORECASE
+)
+
+# A venue-type keyword followed by 1–4 capitalised tokens ("Château La
+# Dominique", "Hotel Belvedere"). Requiring the keyword keeps this from
+# grabbing arbitrary capitalised words.
+_VENDOR_ENTITY = re.compile(
+    r"\b((?:Château|Chateau|Domaine|Maison|Hôtel|Hotel|Restaurant|Villa|Casa|"
+    r"Vineyard|Winery|Estate|Club|Spa|Resort|Bistro|Brasserie|Trattoria)\s+"
+    r"[A-Z][\w'’\-]+(?:\s+[A-Z][\w'’\-]+){0,3})"
+)
+
+# 1–2 capitalised tokens immediately before an activity noun ("Le Charme tour").
+_OFFERING = re.compile(
+    r"\b([A-Z][\w'’\-]+(?:\s+[A-Z][\w'’\-]+)?)\s+"
+    r"(?:tour|tasting|experience|package|menu|visit|session|dinner|lunch)\b"
+)
+
+_URL = re.compile(r"https?://[^\s<>\"')\]]+", re.IGNORECASE)
+
+
+def _status_from_text(text: str) -> Optional[str]:
+    """Best-effort booking-status read from inbound text; None if unclear."""
+    low = text.lower()
+    if re.search(r"\bcancel(?:led|ed|ing)?\b|\bcalled?\s+off\b", low):
+        return "cancelled"
+    if re.search(r"\bnot\s+(?:yet\s+)?booked\b|still\s+needs?\s+(?:to\s+be\s+)?book|"
+                 r"needs\s+booking|isn'?t\s+booked", low):
+        return "not_booked"
+    if re.search(r"\bconfirmed\b|\ball\s+set\b|we'?re\s+booked\b|"
+                 r"booking\s+(?:is\s+)?confirmed\b", low):
+        return "confirmed"
+    if re.search(r"\bon\s+hold\b|\bheld\b|\bholding\b", low):
+        return "held"
+    if re.search(r"\brequested\b|\breached\s+out\b|sent\s+(?:a\s+)?request", low):
+        return "requested"
+    return None
+
+
+def extract_booking_evidence(
+    text: Optional[str], *, has_media: bool = False
+) -> Dict[str, Any]:
+    """Pull anchorable booking facts out of one inbound message.
+
+    Returns a dict of whitelisted ``active_booking_task`` fields. It is
+    *anchorable* (safe to create/enrich a task from) only when it contains a
+    ``vendor_entity`` or a ``reservation_url_or_contact``; otherwise the caller
+    must not create a task from it. A bare status word (e.g. "we're confirmed
+    now") is returned on its own so the caller can route it to a status update
+    of an already-anchored task, but never to a fresh anchor.
+    """
+    text = text or ""
+    facts: Dict[str, Any] = {}
+
+    url_m = _URL.search(text)
+    if url_m:
+        facts["reservation_url_or_contact"] = url_m.group(0).rstrip(".,);]")
+
+    vendor_m = _VENDOR_ENTITY.search(text)
+    if vendor_m:
+        facts["vendor_entity"] = vendor_m.group(1).strip()
+
+    off_m = _OFFERING.search(text)
+    if off_m:
+        cand = off_m.group(1).strip()
+        # Don't mistake the vendor's own tail for the offering.
+        if cand and cand not in facts.get("vendor_entity", ""):
+            facts["offering_name"] = cand
+
+    date_m = _DATE_DAY_MONTH.search(text) or _DATE_MONTH_DAY.search(text)
+    if date_m:
+        facts["date"] = date_m.group(1).strip()
+
+    status = _status_from_text(text)
+
+    anchorable = bool(
+        facts.get("vendor_entity") or facts.get("reservation_url_or_contact")
+    )
+    if not anchorable:
+        # No entity/link → not enough to anchor. Surface only a status signal.
+        return {"booking_status": status} if status else {}
+
+    facts["booking_status"] = status or "not_booked"
+    if has_media:
+        facts["source_evidence_type"] = "screenshot"
+    elif facts.get("reservation_url_or_contact"):
+        facts["source_evidence_type"] = "vendor_reply"
+    else:
+        facts["source_evidence_type"] = "manual_user_statement"
+    facts["source_evidence_summary"] = text.strip()[:280]
+    return facts
+
+
 def _norm(value: Optional[str]) -> str:
     """Normalise a fact for comparison: lowercase, collapse whitespace, strip
     a leading scheme/www so URLs compare on host+path."""

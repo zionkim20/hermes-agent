@@ -8021,6 +8021,91 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         return source
 
+    def _resolve_booking_continuity(self, event, source):
+        """Production resolver for the active booking-task continuity guard.
+
+        Runs on every inbound message. It (a) supersedes the anchored task when
+        the user explicitly asks to switch vendors, (b) creates/enriches the
+        anchored task from high-signal booking evidence in this message —
+        enrich-not-blank and write-time conflict-guarded so a disagreeing value
+        can never overwrite an anchored vendor/offering/date/reservation fact —
+        and (c) applies a status-only update when the message just moves an
+        existing task's booking status. Returns the current anchored task (or
+        None) so the caller can decide whether to inject the preflight note.
+
+        Fully guarded: any failure returns None and never breaks message
+        handling. This is the single production entry point that writes the
+        ``active_booking_task`` row on live messages (HUM-2204 blocker 1).
+        """
+        db = self._session_db
+        if db is None or source is None:
+            return None
+        try:
+            from gateway.booking_continuity import (
+                detect_explicit_switch,
+                detect_conflict,
+                extract_booking_evidence,
+            )
+            platform = source.platform.value if source.platform else ""
+            household_id = f"{platform}:{getattr(source, 'chat_id', '') or ''}"
+            thread = str(
+                getattr(source, "thread_id", None)
+                or getattr(source, "chat_id", "")
+                or ""
+            )
+            text = getattr(event, "text", "") or ""
+            has_media = bool(getattr(event, "media_urls", None))
+            existing = db.get_active_booking_task(household_id, thread)
+
+            # (a) Explicit user switch ("ignore La Dominique, look for Ferrand")
+            # → retire the stale anchor so it stops steering resolution. The row
+            # is kept as superseded (audit trail), never destroyed, and we do
+            # NOT auto-create the new vendor here — the agent re-anchors it when
+            # real evidence arrives.
+            if existing and detect_explicit_switch(text):
+                db.supersede_active_booking_task(household_id, thread)
+                logger.info(
+                    "Booking-continuity: superseded anchored task %s on explicit "
+                    "switch", existing.get("id"),
+                )
+                return None
+
+            # (b)/(c) Extract anchorable evidence from this message.
+            facts = extract_booking_evidence(text, has_media=has_media)
+            anchorable = bool(
+                facts.get("vendor_entity") or facts.get("reservation_url_or_contact")
+            )
+            if anchorable:
+                write = dict(facts)
+                if existing:
+                    # Write-time conflict guard: keep the anchored fact, only
+                    # enrich the non-conflicting / missing ones.
+                    conflict = detect_conflict(existing, facts)
+                    for f in conflict.fields:
+                        write.pop(f, None)
+                    if conflict.conflict:
+                        logger.info(
+                            "Booking-continuity: conflict on %s — anchored facts "
+                            "kept, enriching only %s",
+                            conflict.fields, sorted(write.keys()),
+                        )
+                db.upsert_active_booking_task(household_id, thread, **write)
+                return db.get_active_booking_task(household_id, thread)
+
+            # Status-only signal on an already-anchored task.
+            status = facts.get("booking_status")
+            if status and existing:
+                db.update_booking_status(
+                    int(existing["id"]), status,
+                    mark_confirmed=(status == "confirmed"),
+                )
+                return db.get_active_booking_task(household_id, thread)
+
+            return existing
+        except Exception:
+            logger.debug("booking-continuity resolve skipped", exc_info=True)
+            return None
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -8152,40 +8237,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Build the context prompt to inject
         context_prompt = build_session_context_prompt(context, redact_pii=_redact_pii)
 
-        # ── Active booking-task continuity preflight (HUM-2199 / HUM-1918) ──
-        # If this household has an in-flight external-vendor booking task and
-        # the inbound message references it ("that winery tour", "the
-        # reservation", or a continue/book/confirm intent), anchor those facts
+        # ── Active booking-task continuity (HUM-2199 / HUM-1918 / HUM-2204) ──
+        # Persist/enrich/supersede the household's in-flight external-vendor
+        # booking task from THIS live message, then — if the message references
+        # it ("that winery tour", "the reservation", a continue/book/confirm
+        # intent, or a new screenshot/voice-note arrived) — anchor those facts
         # into the agent context BEFORE it decides to run a fresh lookup. Fully
         # guarded — a failure here must never break message handling.
         try:
-            if self._session_db is not None and source is not None:
-                from gateway.booking_continuity import (
-                    detect_continuity_signal,
-                    build_preflight_note,
+            from gateway.booking_continuity import (
+                detect_continuity_signal,
+                build_preflight_note,
+            )
+            _booking_task = self._resolve_booking_continuity(event, source)
+            _has_new_evidence = bool(getattr(event, "media_urls", None))
+            if _booking_task and detect_continuity_signal(
+                event.text or "", has_new_evidence=_has_new_evidence
+            ):
+                _note = build_preflight_note(_booking_task)
+                context_prompt = _note + "\n\n" + context_prompt
+                logger.info(
+                    "Booking-continuity preflight: anchored task %s (%s) "
+                    "injected (new_evidence=%s)",
+                    _booking_task.get("id"),
+                    _booking_task.get("vendor_entity"),
+                    _has_new_evidence,
                 )
-                _platform = source.platform.value if source.platform else ""
-                _household_id = f"{_platform}:{getattr(source, 'chat_id', '') or ''}"
-                _thread = str(
-                    getattr(source, "thread_id", None)
-                    or getattr(source, "chat_id", "")
-                    or ""
-                )
-                if detect_continuity_signal(event.text or ""):
-                    _booking_task = self._session_db.get_active_booking_task(
-                        _household_id, _thread
-                    )
-                    if _booking_task:
-                        _note = build_preflight_note(_booking_task)
-                        context_prompt = _note + "\n\n" + context_prompt
-                        logger.info(
-                            "Booking-continuity preflight: anchored task %s "
-                            "(%s) injected for %s/%s",
-                            _booking_task.get("id"),
-                            _booking_task.get("vendor_entity"),
-                            _household_id,
-                            _thread,
-                        )
         except Exception as _bc_exc:
             logger.debug("booking-continuity preflight skipped: %s", _bc_exc)
 

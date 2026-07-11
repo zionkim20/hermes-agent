@@ -142,10 +142,15 @@ _VENDOR_ENTITY = re.compile(
     r"[A-Z][\w'’\-]+(?:\s+[A-Z][\w'’\-]+){0,3})"
 )
 
-# 1–2 capitalised tokens immediately before an activity noun ("Le Charme tour").
+# 1–2 capitalised tokens immediately before an activity noun ("Le Charme tour",
+# "Discovery Tour"). The leading tokens stay case-sensitive (the offering name
+# must be capitalised), but the activity noun is matched case-insensitively via a
+# scoped inline flag so common title-cased vendor phrasing ("Discovery Tour",
+# "Prestige Tasting") is captured, not silently dropped. A global re.IGNORECASE
+# would also relax the leading [A-Z] and let it grab lowercase junk ("the tour").
 _OFFERING = re.compile(
     r"\b([A-Z][\w'’\-]+(?:\s+[A-Z][\w'’\-]+)?)\s+"
-    r"(?:tour|tasting|experience|package|menu|visit|session|dinner|lunch)\b"
+    r"(?i:tour|tasting|experience|package|menu|visit|session|dinner|lunch)\b"
 )
 
 _URL = re.compile(r"https?://[^\s<>\"')\]]+", re.IGNORECASE)

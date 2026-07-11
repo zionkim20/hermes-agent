@@ -14,6 +14,7 @@ from gateway.booking_continuity import (
     detect_conflict,
     build_anchored_facts_line,
     build_preflight_note,
+    extract_booking_evidence,
 )
 
 HOUSEHOLD = "whatsapp:renata-family"
@@ -185,3 +186,47 @@ class TestHUM1917Repro:
         assert "Château Ferrand" not in response
         assert "Discovery Tour" not in response
         assert "July 4" not in response
+
+
+class TestTitleCasedOfferingExtraction:
+    """HUM-2205: the offering extractor must capture the descriptor before a
+    title-cased activity noun ("Discovery Tour", "Prestige Tasting"), not only
+    lowercase ones. The leading offering tokens stay case-sensitive so lowercase
+    filler ("the tour") is never mistaken for an offering name."""
+
+    def test_title_cased_tour_offering_captured(self):
+        facts = extract_booking_evidence(
+            "Château Ferrand has a Discovery Tour on July 4. "
+            "Reserve at https://ferrand.example/"
+        )
+        assert facts.get("offering_name") == "Discovery"
+
+    def test_title_cased_tasting_offering_captured(self):
+        facts = extract_booking_evidence(
+            "Domaine Leflaive has a Prestige Tasting available. "
+            "https://leflaive.example/"
+        )
+        assert facts.get("offering_name") == "Prestige"
+
+    def test_multiword_title_cased_offering_captured(self):
+        facts = extract_booking_evidence(
+            "Château La Dominique welcomes your family for the Le Charme Tour "
+            "on 5 July. https://ladominique.example/"
+        )
+        assert facts.get("offering_name") == "Le Charme"
+
+    def test_lowercase_activity_noun_still_captured(self):
+        # Regression guard: the pre-existing lowercase path must keep working.
+        facts = extract_booking_evidence(
+            "Le Charme tour on 5 July at Château La Dominique. "
+            "https://ladominique.example/"
+        )
+        assert facts.get("offering_name") == "Le Charme"
+
+    def test_lowercase_filler_not_mistaken_for_offering(self):
+        # A global re.IGNORECASE would let the leading [A-Z] match "the" here;
+        # the scoped noun-only flag must not.
+        facts = extract_booking_evidence(
+            "Please book the tour for us. https://vendor.example/"
+        )
+        assert "offering_name" not in facts

@@ -27,8 +27,17 @@ def _ensure_telegram_mock():
     # Register telegram.constants as a separate module mock so that
     # ``from telegram.constants import ChatType`` resolves to our mock
     # with string-valued members (not auto-generated MagicMocks).
+    #
+    # NOTE: this force-reimports the shared gateway.platforms.telegram module
+    # (see the pop() below), so whatever we put on ``constants_mod`` becomes
+    # the adapter's module-level ``ParseMode``/``ChatType`` for later tests in
+    # a full-suite run. Leave ParseMode as an auto-MagicMock — the real
+    # telegram enum's repr (``<ParseMode.MARKDOWN_V2: 'MarkdownV2'>``) contains
+    # the token "MARKDOWN_V2", which the MarkdownV2-escape tests assert on; a
+    # plain string "MarkdownV2" does NOT, so pinning it here used to break
+    # test_telegram_{approval_buttons,model_picker,slash_confirm} downstream
+    # (HUM-2208).
     constants_mod = MagicMock()
-    constants_mod.ParseMode.MARKDOWN_V2 = "MarkdownV2"
     constants_mod.ChatType.GROUP = "group"
     constants_mod.ChatType.SUPERGROUP = "supergroup"
     constants_mod.ChatType.CHANNEL = "channel"

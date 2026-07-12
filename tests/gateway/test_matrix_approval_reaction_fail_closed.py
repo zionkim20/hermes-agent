@@ -16,29 +16,14 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 
-# ---------------------------------------------------------------------------
-# Stub mautrix so gateway.platforms.matrix can be imported without the SDK.
-# ---------------------------------------------------------------------------
-
-def _stub_mautrix():
-    stub = types.ModuleType("mautrix")
-    for sub in ("mautrix.types", "mautrix.client", "mautrix.client.api",
-                "mautrix.errors", "mautrix.crypto", "mautrix.util",
-                "mautrix.util.config"):
-        sys.modules.setdefault(sub, types.ModuleType(sub))
-    sys.modules.setdefault("mautrix", stub)
-    m = sys.modules["mautrix.types"]
-    for attr in (
-        "ContentURI", "EventID", "EventType", "PaginationDirection",
-        "PresenceState", "RoomCreatePreset", "RoomID", "SyncToken",
-        "TrustState", "UserID",
-    ):
-        if not hasattr(m, attr):
-            setattr(m, attr, str)
-
-
-_stub_mautrix()
-
+# The matrix adapter module is importable without the mautrix SDK installed:
+# its module-level ``from mautrix.types import ...`` sits behind a try/except
+# that falls back to correct stub classes (EventType.ROOM_MESSAGE,
+# TrustState.UNVERIFIED, ...). We deliberately do NOT install a module-level
+# mautrix stub here — doing so with ``setdefault`` + ``EventType = str`` used
+# to leak a poisoned ``mautrix.types`` into ``sys.modules`` at collection time,
+# binding the shared adapter module's ``EventType``/``TrustState`` to ``str``
+# and breaking every later Matrix test in a full-suite run (HUM-2208).
 from gateway.platforms.matrix import MatrixAdapter, _MatrixApprovalPrompt  # noqa: E402
 
 

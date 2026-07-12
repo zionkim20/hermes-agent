@@ -21,6 +21,16 @@ from gateway.config import PlatformConfig
 
 
 def _ensure_telegram_mock():
+    # When the real python-telegram-bot library is installed, keep it: it is
+    # already bound by ``gateway.platforms.telegram`` (imported before test
+    # collection via the real-library preload in the root conftest). Installing
+    # the string-valued fake here — and popping the production module to force a
+    # reimport against it — would poison every later telegram test in the same
+    # process under randomized order (the fake's ``ParseMode`` is a plain
+    # ``str``, not the real enum). See HUM-2223 / HUM-2208.
+    if "telegram" in sys.modules and hasattr(sys.modules["telegram"], "__file__"):
+        return
+
     telegram_mod = MagicMock()
     telegram_mod.ext.ContextTypes.DEFAULT_TYPE = type(None)
 

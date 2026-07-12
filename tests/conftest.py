@@ -32,6 +32,49 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 
+# ── Real platform libraries win over test fakes (order-independence) ─────────
+# Several gateway test files install fake ``telegram`` / ``slack_bolt`` /
+# ``slack_sdk`` modules into ``sys.modules`` as a fallback for environments
+# where the real library is absent. Their installers guard with
+# ``if <lib> in sys.modules and hasattr(..., "__file__"): return`` (or a bare
+# presence check), so the REAL library is kept whenever it is already imported.
+#
+# Production adapters bind these libraries at *import time* — e.g.
+# ``from telegram.constants import ParseMode`` in ``gateway/platforms/telegram``
+# and ``from slack_bolt.async_app import AsyncApp`` in ``gateway/platforms/slack``.
+# Whichever test first triggers that production import decides, permanently,
+# whether the real enum/class or a string/MagicMock fake is bound. Under
+# ``pytest-randomly`` that "first importer" varies by seed, so a fake installed
+# first shadows the real library and downstream assertions (``repr(ParseMode…)``,
+# ``isinstance(client, AsyncWebClient)``) flip — a genuine cross-test leak that
+# only bites the single-process order-guard (HUM-2210), not the per-file
+# subprocess runner.
+#
+# Importing the real libraries here — before any subdir conftest or test module
+# is collected — makes every installer's guard short-circuit, so the real
+# library is bound in *every* order. This mirrors the deterministic-order
+# behaviour that is already green. Fakes still apply when a library is genuinely
+# absent (the import fails silently). NOTE: ``discord`` is intentionally NOT
+# forced here — the gateway discord tests are written against the comprehensive
+# fake in ``tests/gateway/conftest.py`` and fail against the real ``discord.py``
+# API; discord order-stability is handled by keeping that fake consistent.
+for _real_platform_lib in (
+    "telegram",
+    "telegram.ext",
+    "telegram.constants",
+    "telegram.request",
+    "telegram.error",
+    "slack_bolt",
+    "slack_bolt.async_app",
+    "slack_sdk",
+    "slack_sdk.web.async_client",
+):
+    try:
+        __import__(_real_platform_lib)
+    except Exception:
+        pass  # library genuinely absent — per-file fakes will stand in
+
+
 # ── Per-file process isolation ──────────────────────────────────────────────
 # Tests run via ``scripts/run_tests_parallel.py``, which spawns a fresh
 # ``python -m pytest <file>`` subprocess per test file. Cross-file state
@@ -399,6 +442,37 @@ def _hermetic_environment(tmp_path, monkeypatch):
 def _isolate_hermes_home(_hermetic_environment):
     """Alias preserved for any test that yields this name explicitly."""
     return None
+
+
+@pytest.fixture(autouse=True)
+def _restore_os_environ(_hermetic_environment):
+    """Hard-restore ``os.environ`` after every test.
+
+    Production helpers bridge YAML config into the environment via direct
+    ``os.environ[...] = ...`` writes that pytest's ``monkeypatch`` does not
+    track. The clearest offender is ``gateway.config.load_gateway_config()``,
+    which exports ``SLACK_ALLOWED_CHANNELS`` / ``SLACK_REQUIRE_MENTION`` /
+    ``TELEGRAM_*`` etc. from the loaded config. A test that both
+    ``monkeypatch.delenv("SLACK_ALLOWED_CHANNELS", raising=False)`` (which,
+    when the var is already absent, records *nothing* to undo) and then calls
+    ``load_gateway_config()`` leaves the exported value set after teardown.
+    In the single-process order-guard run that silently poisons unrelated
+    routing tests (e.g. ``test_channel_mention_strips_bot_id`` sees a stale
+    channel whitelist and drops the message) — a genuine cross-test leak that
+    changes with the randomized seed. See HUM-2223 / HUM-2208.
+
+    Depending on ``_hermetic_environment`` makes this fixture set up *after*
+    the credential scrub, so the snapshot captures the clean, deterministic
+    per-test environment; restoring it on teardown removes any untracked
+    writes a test made while running. ``monkeypatch``-based env changes are
+    still unwound independently and remain compatible (the restore is
+    idempotent with them).
+    """
+    snapshot = dict(os.environ)
+    yield
+    if os.environ != snapshot:
+        os.environ.clear()
+        os.environ.update(snapshot)
 
 
 # ── Module-level state reset — replaced by per-file process isolation ──────

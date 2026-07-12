@@ -17,6 +17,8 @@ UpdatePromptView, ModelPickerView, ClarifyChoiceView.
 import importlib
 from unittest.mock import patch
 
+import pytest
+
 
 _VIEW_NAMES = [
     "ExecApprovalView",
@@ -25,6 +27,35 @@ _VIEW_NAMES = [
     "ModelPickerView",
     "ClarifyChoiceView",
 ]
+
+_MISSING = object()
+
+
+@pytest.fixture(autouse=True)
+def _restore_discord_view_classes():
+    """Restore the adapter's UI view-class globals after each test.
+
+    These tests exercise ``_define_discord_view_classes()``, which (re)binds
+    ``ExecApprovalView`` … ``ClarifyChoiceView`` as *new* class objects in
+    ``plugins.platforms.discord.adapter``'s module globals. ``monkeypatch``
+    only tracks the attributes a test explicitly patches — the view classes
+    redefined as a side effect of ``check_discord_requirements()`` are NOT
+    tracked, so they leak new class objects into the shared module. Any later
+    test that imported e.g. ``ClarifyChoiceView`` at collection then does
+    ``assert isinstance(view, ClarifyChoiceView)`` fails: the runtime object is
+    an instance of the *redefined* class, not the one it imported. Snapshot the
+    original class objects and restore them so cross-test class identity is
+    stable under randomized order. See HUM-2223 / HUM-2208.
+    """
+    dp = importlib.import_module("plugins.platforms.discord.adapter")
+    saved = {name: getattr(dp, name, _MISSING) for name in _VIEW_NAMES}
+    yield
+    for name, original in saved.items():
+        if original is _MISSING:
+            if hasattr(dp, name):
+                delattr(dp, name)
+        else:
+            setattr(dp, name, original)
 
 
 class TestDefineDiscordViewClasses:

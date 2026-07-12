@@ -228,6 +228,31 @@ _ensure_telegram_mock()
 _ensure_discord_mock()
 
 
+@pytest.fixture(autouse=True)
+def _release_gateway_runtime_lock():
+    """Release the process-global gateway runtime lock after every test.
+
+    ``gateway.status`` keeps the runtime lock in a module global
+    (``_gateway_lock_handle``). Tests that exercise the real ``start_gateway``
+    / ``gateway.run`` path (e.g.
+    ``test_runner_startup_failures.py::test_start_gateway_replace_writes_...``)
+    call ``acquire_gateway_runtime_lock()`` for real but never release it, so
+    the handle — pointing at a now-deleted per-test ``HERMES_HOME`` lock file —
+    leaks into later tests. ``test_status.py`` then sees
+    ``acquire_gateway_runtime_lock()`` short-circuit on the stale handle and
+    ``get_running_pid()`` resolves against the wrong lock, failing only under
+    the single-process order-guard (HUM-2210). Release it in teardown so the
+    global is clean regardless of test order. See HUM-2223 / HUM-2208.
+    """
+    yield
+    status_mod = sys.modules.get("gateway.status")
+    if status_mod is not None and getattr(status_mod, "_gateway_lock_handle", None) is not None:
+        try:
+            status_mod.release_gateway_runtime_lock()
+        except Exception:
+            status_mod._gateway_lock_handle = None
+
+
 # ---------------------------------------------------------------------------
 # Plugin-adapter anti-pattern guard
 # ---------------------------------------------------------------------------

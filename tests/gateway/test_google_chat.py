@@ -129,6 +129,37 @@ import plugins.platforms.google_chat.adapter as _gc_mod  # noqa: E402
 
 _gc_mod.GOOGLE_CHAT_AVAILABLE = True
 
+# Realize the adapter's lazily-imported google globals (``service_account``,
+# ``pubsub_v1`` …) NOW, at collection, against the shim installed above.
+# ``_load_google_modules()`` caches on first call and binds module globals that
+# start out ``None`` (see ``service_account: Any = None`` in the adapter).
+# Without this, whichever test calls ``check_google_chat_requirements()`` /
+# constructs an adapter first populates them; under pytest-randomly a test that
+# reads ``_gc_mod.service_account.Credentials`` before any such call hits the
+# import-time ``None`` and fails (``'NoneType' has no attribute 'Credentials'``)
+# — an order-dependent leak that only bites the single-process order-guard.
+# See HUM-2223 / HUM-2208.
+_gc_mod.check_google_chat_requirements()
+
+# Register the google_chat platform in the global registry at collection.
+# ``_is_user_authorized`` resolves a plugin platform's allowlist env var
+# (``GOOGLE_CHAT_ALLOWED_USERS``) via ``platform_registry.get("google_chat")``;
+# the authorization tests assume it is registered but do not register it
+# themselves. Registration is otherwise done lazily by whichever test calls
+# ``_ensure_registered()`` first, so under pytest-randomly a test that runs
+# before any of those sees an unregistered platform and its allowlist match
+# silently fails. Register once here (idempotent) so registry-dependent tests
+# are order-independent. See HUM-2223 / HUM-2208.
+try:
+    from gateway.platform_registry import platform_registry as _gc_platform_registry
+
+    if _gc_platform_registry.get("google_chat") is None:
+        from hermes_cli.plugins import discover_plugins as _gc_discover_plugins
+
+        _gc_discover_plugins()
+except Exception:
+    pass
+
 from gateway.platforms.base import MessageEvent, MessageType, ProcessingOutcome  # noqa: E402
 from plugins.platforms.google_chat.adapter import (  # noqa: E402
     GoogleChatAdapter,

@@ -113,6 +113,12 @@ def _count_tests(
 
     cmd = [
         sys.executable, "-m", "pytest",
+        # Keep the per-file runner deterministic: pytest-randomly (a dev
+        # dep, see the order-guard CI job) auto-activates on import and
+        # would otherwise shuffle test order inside each file. Cross-file
+        # order-leak detection is the order-guard job's responsibility;
+        # this runner's contract is stable, reproducible per-file runs.
+        "-p", "no:randomly",
         "--co", "-q",
         *ignore_args,
         *[str(f) for f in files],
@@ -278,7 +284,11 @@ def _run_one_file(
     timeouts inside the subprocess; this outer timeout exists only to
     bound a pathologically slow or hung file as a whole.
     """
-    cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
+    # -p no:randomly: pytest-randomly auto-activates on import (it's a dev
+    # dep). Per-file runs stay in deterministic definition order so a
+    # failing file reproduces identically on re-run; the order-guard CI
+    # job owns randomized cross-file leak detection.
+    cmd = [sys.executable, "-m", "pytest", "-p", "no:randomly", str(file), *pytest_args]
     subproc_start = time.monotonic()
     proc = subprocess.Popen(
         cmd,

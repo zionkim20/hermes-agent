@@ -16,6 +16,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Dict, Optional, Any, Tuple, List
 
 try:
@@ -2294,6 +2295,7 @@ class SlackAdapter(BasePlatformAdapter):
         channel_type = event.get("channel_type", "")
         if not channel_type and channel_id.startswith("D"):
             channel_type = "im"
+        is_mpim = channel_type == "mpim"
         is_dm = channel_type in {"im", "mpim"}  # Both 1:1 and group DMs
 
         # Build thread_ts for session keying.
@@ -2353,6 +2355,11 @@ class SlackAdapter(BasePlatformAdapter):
         is_mentioned = bot_uid and f"<@{bot_uid}>" in routing_text
         event_thread_ts = event.get("thread_ts")
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
+        observe_only_mpim = bool(
+            is_mpim
+            and channel_id in self._slack_mention_only_mpim_channels()
+            and not is_mentioned
+        )
 
         if not is_dm and bot_uid:
             # Check allowed channels — if set, only respond in these channels (whitelist)
@@ -2407,7 +2414,7 @@ class SlackAdapter(BasePlatformAdapter):
 
         # When entering a thread for the first time (no existing session),
         # fetch thread context so the agent understands the conversation.
-        if is_thread_reply and not self._has_active_session_for_thread(
+        if not observe_only_mpim and is_thread_reply and not self._has_active_session_for_thread(
             channel_id=channel_id,
             thread_ts=event_thread_ts,
             user_id=user_id,
@@ -2642,6 +2649,13 @@ class SlackAdapter(BasePlatformAdapter):
             channel_id,
             None,
         )
+        if is_mpim and channel_id in self._slack_mention_only_mpim_channels():
+            observe_prompt = self._slack_mpim_observe_channel_prompt()
+            _channel_prompt = (
+                f"{_channel_prompt}\n\n{observe_prompt}"
+                if _channel_prompt
+                else observe_prompt
+            )
         _auto_skill = resolve_channel_skills(
             self.config.extra,
             channel_id,
@@ -2680,6 +2694,10 @@ class SlackAdapter(BasePlatformAdapter):
             reply_to_text=reply_to_text,
             auto_skill=_auto_skill,
         )
+
+        if observe_only_mpim:
+            self._observe_unaddressed_mpim_message(msg_event)
+            return
 
         # Only react when bot is directly addressed (DM or @mention).
         # In listen-all channels (require_mention=false), reacting to every
@@ -3604,6 +3622,67 @@ class SlackAdapter(BasePlatformAdapter):
             "yes",
             "on",
         }
+
+    def _slack_mention_only_mpim_channels(self) -> set:
+        """Multi-person DMs that are observed but only dispatch on @mention."""
+        raw = self.config.extra.get("mention_only_mpim_channels")
+        if raw is None:
+            raw = os.getenv("SLACK_MENTION_ONLY_MPIM_CHANNELS", "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        return {
+            part.strip()
+            for part in str(raw or "").split(",")
+            if part.strip()
+        }
+
+    @staticmethod
+    def _slack_mpim_observe_channel_prompt() -> str:
+        return (
+            "You are handling a Slack multi-person DM.\n"
+            "- observed Slack MPDM context may be provided in a separate context-only block "
+            "before the current message; it is not addressed to you.\n"
+            "- Only the current message containing an explicit @mention of you is a request. "
+            "Use the observed context for awareness, but do not treat it as pending work."
+        )
+
+    def _observe_unaddressed_mpim_message(self, event: MessageEvent) -> None:
+        """Persist unaddressed MPDM traffic as context without running the agent."""
+        store = getattr(self, "_session_store", None)
+        if not store or event.source is None:
+            return
+        try:
+            session_entry = store.get_or_create_session(event.source)
+            user_id = event.source.user_id or "unknown"
+            sender = event.source.user_name or user_id
+            content = f"[{sender}|{user_id}]\n{event.text or ''}"
+            if event.media_urls:
+                attachments = [
+                    f"[Observed attachment: {mime or 'unknown'} {path}]"
+                    for path, mime in zip(event.media_urls, event.media_types)
+                ]
+                content = f"{content}\n\n" + "\n".join(attachments)
+            entry = {
+                "role": "user",
+                "content": content,
+                "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+                "observed": True,
+            }
+            if event.message_id:
+                entry["message_id"] = str(event.message_id)
+            store.append_to_transcript(session_entry.session_id, entry)
+            logger.info(
+                "[%s] Slack MPDM message observed (no bot mention): chat=%s from=%s",
+                getattr(self, "name", "slack"),
+                event.source.chat_id or "unknown",
+                user_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[%s] Failed to observe Slack MPDM message: %s",
+                getattr(self, "name", "slack"),
+                exc,
+            )
 
     def _slack_free_response_channels(self) -> set:
         """Return channel IDs where no @mention is required."""

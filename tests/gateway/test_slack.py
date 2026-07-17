@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import os
 import sys
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch, call
 
 import pytest
@@ -2657,6 +2658,77 @@ class TestThreadReplyHandling:
         }
         await adapter._handle_slack_message(event)
         adapter.handle_message.assert_not_called()
+
+
+class TestMentionOnlyMpim:
+    @staticmethod
+    def _event(text: str) -> dict:
+        return {
+            "text": text,
+            "user": "U_CAROL",
+            "channel": "C_MPIM",
+            "ts": "1784300000.100000",
+            "channel_type": "mpim",
+            "team": "T_TEAM",
+        }
+
+    @pytest.mark.asyncio
+    async def test_unmentioned_mpim_message_is_observed_without_dispatch(self, adapter):
+        adapter.config.extra["mention_only_mpim_channels"] = ["C_MPIM"]
+        adapter._user_name_cache["U_CAROL"] = "Carol"
+        store = MagicMock()
+        store.get_or_create_session.return_value = SimpleNamespace(session_id="session-1")
+        adapter.set_session_store(store)
+
+        await adapter._handle_slack_message(self._event("Zion, the invoices are ready."))
+
+        adapter.handle_message.assert_not_awaited()
+        store.append_to_transcript.assert_called_once()
+        session_id, entry = store.append_to_transcript.call_args.args
+        assert session_id == "session-1"
+        assert entry["observed"] is True
+        assert entry["content"] == "[Carol|U_CAROL]\nZion, the invoices are ready."
+
+    @pytest.mark.asyncio
+    async def test_mentioned_mpim_message_dispatches_with_observed_context_prompt(self, adapter):
+        adapter.config.extra["mention_only_mpim_channels"] = ["C_MPIM"]
+        adapter._team_bot_user_ids = {"T_TEAM": "U_BOT"}
+        adapter._user_name_cache["U_CAROL"] = "Carol"
+
+        await adapter._handle_slack_message(
+            self._event("<@U_BOT> please summarize the invoice discussion")
+        )
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.text == "please summarize the invoice discussion"
+        assert "observed Slack MPDM context" in event.channel_prompt
+
+    @pytest.mark.asyncio
+    async def test_unconfigured_mpim_keeps_legacy_dispatch_behavior(self, adapter):
+        adapter._user_name_cache["U_CAROL"] = "Carol"
+        await adapter._handle_slack_message(self._event("ordinary group DM message"))
+
+        adapter.handle_message.assert_awaited_once()
+
+    def test_observed_mpim_history_is_context_not_a_request(self):
+        from gateway.run import _build_gateway_agent_history
+
+        history = [
+            {
+                "role": "user",
+                "content": "[Carol|U_CAROL]\nThe invoices are ready.",
+                "observed": True,
+            }
+        ]
+
+        agent_history, observed_context = _build_gateway_agent_history(
+            history,
+            channel_prompt="observed Slack MPDM context",
+        )
+
+        assert agent_history == []
+        assert observed_context == "[Carol|U_CAROL]\nThe invoices are ready."
 
 
 # ---------------------------------------------------------------------------

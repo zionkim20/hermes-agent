@@ -55,7 +55,8 @@ CHANNEL_ID = "C0AQWDLHY9M"
 OTHER_CHANNEL_ID = "C9999999999"
 
 
-def _make_adapter(require_mention=None, strict_mention=None, free_response_channels=None, allowed_channels=None):
+def _make_adapter(require_mention=None, strict_mention=None, free_response_channels=None, allowed_channels=None,
+                  mention_only_mpim_channels=None):
     extra = {}
     if require_mention is not None:
         extra["require_mention"] = require_mention
@@ -65,6 +66,8 @@ def _make_adapter(require_mention=None, strict_mention=None, free_response_chann
         extra["free_response_channels"] = free_response_channels
     if allowed_channels is not None:
         extra["allowed_channels"] = allowed_channels
+    if mention_only_mpim_channels is not None:
+        extra["mention_only_mpim_channels"] = mention_only_mpim_channels
 
     adapter = object.__new__(SlackAdapter)
     adapter.platform = Platform.SLACK
@@ -178,6 +181,20 @@ def test_strict_mention_env_var_fallback(monkeypatch):
     monkeypatch.setenv("SLACK_STRICT_MENTION", "true")
     adapter = _make_adapter()  # no config value -> falls back to env
     assert adapter._slack_strict_mention() is True
+
+
+def test_mention_only_mpim_channels_from_list():
+    adapter = _make_adapter(mention_only_mpim_channels=[CHANNEL_ID, OTHER_CHANNEL_ID])
+    assert adapter._slack_mention_only_mpim_channels() == {CHANNEL_ID, OTHER_CHANNEL_ID}
+
+
+def test_mention_only_mpim_channels_from_env(monkeypatch):
+    monkeypatch.setenv(
+        "SLACK_MENTION_ONLY_MPIM_CHANNELS",
+        f"{CHANNEL_ID}, {OTHER_CHANNEL_ID}",
+    )
+    adapter = _make_adapter()
+    assert adapter._slack_mention_only_mpim_channels() == {CHANNEL_ID, OTHER_CHANNEL_ID}
 
 
 # ---------------------------------------------------------------------------
@@ -514,6 +531,29 @@ def test_config_bridges_slack_strict_mention(monkeypatch, tmp_path):
     assert config is not None
     import os as _os
     assert _os.environ["SLACK_STRICT_MENTION"] == "true"
+
+
+def test_config_bridges_slack_mention_only_mpim_channels(monkeypatch, tmp_path):
+    from gateway.config import load_gateway_config
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "slack:\n"
+        "  mention_only_mpim_channels:\n"
+        "    - C0AQWDLHY9M\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("SLACK_MENTION_ONLY_MPIM_CHANNELS", raising=False)
+
+    config = load_gateway_config()
+
+    slack_extra = config.platforms[Platform.SLACK].extra
+    assert slack_extra["mention_only_mpim_channels"] == ["C0AQWDLHY9M"]
+    import os as _os
+    assert _os.environ["SLACK_MENTION_ONLY_MPIM_CHANNELS"] == "C0AQWDLHY9M"
 
 
 # ---------------------------------------------------------------------------

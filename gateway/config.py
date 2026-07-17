@@ -947,6 +947,8 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["observe_unaddressed_groups"] = platform_cfg["observe_unaddressed_groups"]
                 if "free_response_channels" in platform_cfg:
                     bridged["free_response_channels"] = platform_cfg["free_response_channels"]
+                if plat == Platform.SLACK and "mention_only_mpim_channels" in platform_cfg:
+                    bridged["mention_only_mpim_channels"] = platform_cfg["mention_only_mpim_channels"]
                 if "free_response_chats" in platform_cfg:
                     bridged["free_response_chats"] = platform_cfg["free_response_chats"]
                 if "mention_patterns" in platform_cfg:
@@ -1052,6 +1054,11 @@ def load_gateway_config() -> GatewayConfig:
                     if isinstance(ac, list):
                         ac = ",".join(str(v) for v in ac)
                     os.environ["SLACK_ALLOWED_CHANNELS"] = str(ac)
+                momc = slack_cfg.get("mention_only_mpim_channels")
+                if momc is not None and not os.getenv("SLACK_MENTION_ONLY_MPIM_CHANNELS"):
+                    if isinstance(momc, list):
+                        momc = ",".join(str(v) for v in momc)
+                    os.environ["SLACK_MENTION_ONLY_MPIM_CHANNELS"] = str(momc)
 
             # Bridge top-level require_mention to Telegram when the telegram: section
             # does not already provide one.  Users often write "require_mention: true"

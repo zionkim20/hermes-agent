@@ -722,6 +722,12 @@ platform_toolsets:
 #   reactions: true                  # Show processing reactions (default: true)
 #   history_backfill: true           # Recover missed channel messages on mention (default: true)
 #   history_backfill_limit: 50       # Max messages to scan backwards (default: 50)
+#
+# Slack multi-person DM settings (config.yaml top-level):
+#
+# slack:
+#   # Observe all messages in these MPDMs, but run/respond only when @mentioned.
+#   mention_only_mpim_channels: ["C0123456789"]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Available toolsets (use these names in platform_toolsets or the toolsets list)

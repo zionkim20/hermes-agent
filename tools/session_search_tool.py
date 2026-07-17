@@ -296,16 +296,14 @@ def _scroll(
             window = 5
     window = max(1, min(window, 20))
 
-    # Reject scrolling inside the active session lineage — those messages are
-    # already in context.
-    if current_session_id:
-        a_root = _resolve_to_parent(db, session_id)
-        c_root = _resolve_to_parent(db, current_session_id)
-        if a_root and c_root and a_root == c_root:
-            return tool_error(
-                "scroll rejected: anchor lives in the current session lineage (already in your active context)",
-                success=False,
-            )
+    # Reject only the active session itself. Compression ancestors share the
+    # same lineage but their original messages are no longer guaranteed to be
+    # present in the compacted context, so they must remain readable.
+    if current_session_id and session_id == current_session_id:
+        return tool_error(
+            "scroll rejected: anchor lives in the current session (already in your active context)",
+            success=False,
+        )
 
     # Session existence check
     try:
@@ -424,8 +422,6 @@ def _discover(
             "message": "No matching sessions found.",
         }, ensure_ascii=False)
 
-    current_lineage_root = _resolve_to_parent(db, current_session_id) if current_session_id else None
-
     # Dedupe by lineage. Keep the raw owning session_id on the surviving
     # row — only that pairs validly with the FTS5 match id for the anchored
     # window. parent_session_id is exposed separately when different.
@@ -433,9 +429,8 @@ def _discover(
     for r in raw_results:
         raw_sid = r["session_id"]
         resolved_sid = _resolve_to_parent(db, raw_sid)
-        # Skip the current session lineage
-        if current_lineage_root and resolved_sid == current_lineage_root:
-            continue
+        # Skip only the active session. Compression ancestors in the same
+        # lineage may contain details omitted from the compacted context.
         if current_session_id and raw_sid == current_session_id:
             continue
         if resolved_sid not in seen_sessions:

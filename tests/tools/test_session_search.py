@@ -204,6 +204,27 @@ class TestDiscoveryShape:
         sids = [r["session_id"] for r in result["results"]]
         assert "s_newest" not in sids
 
+    def test_compressed_parent_in_current_lineage_is_searchable(self, db):
+        db.create_session("parent", source="telegram")
+        db.append_message(
+            "parent",
+            role="assistant",
+            content="Verified Partiful page: https://partiful.com/e/example",
+        )
+        db.end_session("parent", end_reason="compression")
+        db.create_session("child", source="telegram", parent_session_id="parent")
+        db.append_message("child", role="user", content="Please update the image")
+
+        result = json.loads(session_search(
+            query="Partiful",
+            db=db,
+            current_session_id="child",
+        ))
+
+        assert result["success"] is True
+        assert result["sessions_searched"] == 1
+        assert result["results"][0]["session_id"] == "parent"
+
 
 class TestDiscoverySort:
     def test_sort_newest_orders_by_recency(self, db):
@@ -339,6 +360,27 @@ class TestScrollShape:
             ))
             assert result["success"] is False
             assert "current session" in result.get("error", "").lower()
+
+    def test_scroll_allows_compressed_parent_in_current_lineage(self, db):
+        db.create_session("parent", source="telegram")
+        message_id = db.append_message(
+            "parent",
+            role="assistant",
+            content="Verified Partiful page: https://partiful.com/e/example",
+        )
+        db.end_session("parent", end_reason="compression")
+        db.create_session("child", source="telegram", parent_session_id="parent")
+
+        result = json.loads(session_search(
+            session_id="parent",
+            around_message_id=message_id,
+            db=db,
+            current_session_id="child",
+        ))
+
+        assert result["success"] is True
+        assert result["session_id"] == "parent"
+        assert result["messages"][0]["id"] == message_id
 
     def test_scroll_invalid_around_message_id_errors(self, db):
         _seed_modpack_sessions(db)
